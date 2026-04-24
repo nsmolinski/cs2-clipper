@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="cs2-clipper.vcxproj" Id="13db9162-f157-436f-a519-dff00cec9c2c" />
+</Solution>
