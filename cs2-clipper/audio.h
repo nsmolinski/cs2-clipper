@@ -18,3 +18,17 @@ bool CaptureAudioLoop(
     int bufferSeconds,
     long long qpcFrequency
 );
+
+bool GetLoopbackMixFormat(
+    int& sampleRate,
+    int& channels,
+    int& bitsPerSample,
+    bool& isFloat
+);
+
+bool CaptureAudioToPipeLoop(
+    const std::string& pipePath,
+    std::atomic<bool>& runningFlag,
+    CaptureTiming& timing,
+    long long qpcFrequency
+);

@@ -9,11 +9,8 @@
 #include <thread>
 #include <atomic>
 #include <string>
-#include <sstream>
-#include <iomanip>
 #include <cstdlib>
 #include <cmath>
-#include <cstdio>
 
 #include "audio.h"
 
@@ -34,12 +31,14 @@ std::atomic<bool> audioRunning{ false };
 std::thread audioThread;
 
 std::string ffmpegPath;
-std::string ffprobePath;
+std::string tempSessionPath;
 std::string segmentDirPath;
-std::string audioPath;
-std::string stitchedVideoPath;
 std::string finalPath;
 std::string concatListPath;
+std::string audioPipePath;
+std::string audioSampleFmt;
+int audioSampleRate = 48000;
+int audioChannels = 2;
 std::string sessionId;
 bool videoStarted = false;
 bool audioStarted = false;
@@ -47,7 +46,6 @@ CaptureTiming timing;
 LARGE_INTEGER qpcFrequency{};
 LARGE_INTEGER sessionStartQpc{};
 constexpr int kDefaultReplayBufferSeconds = 15;
-constexpr double kDynamicSyncBiasMs = 0.0;
 constexpr int kCaptureStartDelayMs = 1000;
 
 HWND cs2Window = nullptr;
@@ -57,7 +55,6 @@ int captureWidth = 0, captureHeight = 0;
 
 uint64_t lastPresentTime = 0;
 int replayBufferSeconds = kDefaultReplayBufferSeconds;
-double audioAdvanceMs = kDynamicSyncBiasMs;
 
 int GetReplayBufferSeconds()
 {
@@ -87,116 +84,9 @@ std::string FindFFmpeg()
     return std::filesystem::exists(path) ? path.string() : "";
 }
 
-std::string FindFFprobe()
-{
-    auto path = std::filesystem::current_path() / "ffmpeg" / "bin" / "ffprobe.exe";
-    return std::filesystem::exists(path) ? path.string() : "";
-}
-
-std::string FormatSeconds(double seconds)
-{
-    std::ostringstream ss;
-    ss << std::fixed << std::setprecision(3) << seconds;
-    return ss.str();
-}
-
 std::string BuildSessionId()
 {
     return std::to_string(std::time(nullptr));
-}
-
-double GetAudioAdvanceMs()
-{
-    return kDynamicSyncBiasMs;
-}
-
-struct StreamPtsInfo
-{
-    bool ok = false;
-    double firstPtsMs = -1.0;
-    double lastPtsMs = -1.0;
-    int sampleCount = 0;
-};
-
-StreamPtsInfo ProbeStreamPtsMs(
-    const std::string& ffprobeExePath,
-    const std::string& mediaPath,
-    const std::string& streamSelector,
-    const std::string& logPath,
-    const std::string& stageLabel)
-{
-    StreamPtsInfo info{};
-    if (ffprobeExePath.empty() || mediaPath.empty()) {
-        return info;
-    }
-
-    std::string cmd =
-        "\"" + ffprobeExePath + "\" -v error "
-        "-select_streams " + streamSelector + " "
-        "-show_entries packet=pts_time "
-        "-of default=noprint_wrappers=1:nokey=1 "
-        "\"" + mediaPath + "\"";
-
-    const bool canLog = !logPath.empty();
-    if (canLog) {
-        std::ofstream log(logPath, std::ios::app);
-        if (log.is_open()) {
-            log << "\n==== " << stageLabel << " ====\n";
-            log << cmd << "\n";
-        }
-    }
-
-    FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) {
-        if (canLog) {
-            std::ofstream log(logPath, std::ios::app);
-            if (log.is_open()) {
-                log << "ffprobe popen failed\n";
-            }
-        }
-        return info;
-    }
-
-    char buffer[256]{};
-    while (fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
-        std::string line(buffer);
-        // Trim whitespace/newline.
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
-            line.pop_back();
-        }
-        if (line.empty() || line == "N/A") {
-            continue;
-        }
-
-        try {
-            const double ptsSeconds = std::stod(line);
-            const double ptsMs = ptsSeconds * 1000.0;
-            if (info.firstPtsMs < 0.0) {
-                info.firstPtsMs = ptsMs;
-            }
-            info.lastPtsMs = ptsMs;
-            info.sampleCount++;
-        }
-        catch (...) {
-            // Ignore malformed lines.
-        }
-    }
-
-    const int probeExitCode = _pclose(pipe);
-    info.ok = (probeExitCode == 0 && info.sampleCount > 0);
-
-    if (canLog) {
-        std::ofstream log(logPath, std::ios::app);
-        if (log.is_open()) {
-            log << "ffprobe result (" << stageLabel << "): exit=" << probeExitCode
-                << ", ok=" << (info.ok ? "true" : "false")
-                << ", samples=" << info.sampleCount
-                << ", firstPtsMs=" << info.firstPtsMs
-                << ", lastPtsMs=" << info.lastPtsMs << "\n";
-        }
-    }
-
-    return info;
 }
 
 bool BuildResolvedConcatList(const std::string& sourcePath, const std::string& targetPath)
@@ -271,22 +161,41 @@ void PrepareOutputPaths()
 {
     std::filesystem::create_directories("C:\\CS2Recordings");
     sessionId = BuildSessionId();
-    std::filesystem::path tempBase = std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId);
+    const std::filesystem::path tempBase = std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId);
+    tempSessionPath = tempBase.string();
     std::filesystem::create_directories(tempBase);
     segmentDirPath = (tempBase / "segments").string();
-    audioPath = "C:\\CS2Recordings\\audio_" + sessionId + ".wav";
-    stitchedVideoPath = "C:\\CS2Recordings\\video_stitched_" + sessionId + ".mp4";
     finalPath = "C:\\CS2Recordings\\cs2_recording_" + sessionId + ".mp4";
     concatListPath = (tempBase / "segments.ffconcat").string();
+    audioPipePath = "\\\\.\\pipe\\cs2-clipper-audio-" + sessionId;
     std::filesystem::create_directories(segmentDirPath);
 }
 
 void StartFFmpeg()
 {
     ffmpegPath = FindFFmpeg();
-    ffprobePath = FindFFprobe();
     if (ffmpegPath.empty()) {
         std::cout << "FFmpeg not found\n";
+        return;
+    }
+
+    int bitsPerSample = 0;
+    bool isFloat = false;
+    if (!GetLoopbackMixFormat(audioSampleRate, audioChannels, bitsPerSample, isFloat)) {
+        std::cout << "Failed to get loopback audio format\n";
+        return;
+    }
+    if (isFloat && bitsPerSample == 32) {
+        audioSampleFmt = "f32le";
+    }
+    else if (bitsPerSample == 16) {
+        audioSampleFmt = "s16le";
+    }
+    else if (bitsPerSample == 32) {
+        audioSampleFmt = "s32le";
+    }
+    else {
+        std::cout << "Unsupported audio format (" << bitsPerSample << " bits)\n";
         return;
     }
 
@@ -298,6 +207,10 @@ void StartFFmpeg()
         "-f rawvideo -pix_fmt bgra "
         "-s " + std::to_string(WIDTH) + "x" + std::to_string(HEIGHT) + " "
         "-r 60 -i - "
+        "-f " + audioSampleFmt + " "
+        "-ar " + std::to_string(audioSampleRate) + " "
+        "-ac " + std::to_string(audioChannels) + " "
+        "-i \"" + audioPipePath + "\" "
         "-vf crop=" +
         std::to_string(captureWidth) + ":" +
         std::to_string(captureHeight) + ":" +
@@ -313,6 +226,7 @@ void StartFFmpeg()
         "-sc_threshold 0 "
         "-force_key_frames \"expr:gte(t,n_forced*1)\" "
         "-pix_fmt yuv420p "
+        "-c:a aac -b:a 192k "
         "-f segment -segment_time 1 -segment_wrap " + std::to_string(segmentWrapCount) + " "
         "-segment_list \"" + concatListPath + "\" "
         "-segment_list_type ffconcat "
@@ -347,7 +261,7 @@ void StartAudio()
     audioRunning = true;
     audioStarted = true;
     audioThread = std::thread([] {
-        CaptureAudioLoop(audioPath, audioRunning, timing, replayBufferSeconds, qpcFrequency.QuadPart);
+        CaptureAudioToPipeLoop(audioPipePath, audioRunning, timing, qpcFrequency.QuadPart);
     });
 }
 
@@ -364,114 +278,33 @@ void StopAudio()
 void MergeAudioVideo()
 {
     if (ffmpegPath.empty()) return;
-    if (!std::filesystem::exists(audioPath)) {
-        std::cout << "Skipping merging - missing audio file.\n";
-        return;
-    }
     if (!std::filesystem::exists(concatListPath)) {
         std::cout << "Skipping merging - missing segment list.\n";
         return;
     }
-    std::cout << "Merging replay buffer using FFmpeg segment list + audio\n";
+    std::cout << "Merging replay buffer (audio+video from same FFmpeg timeline)\n";
     const std::string resolvedConcatListPath =
-        (std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId) / "segments_resolved.ffconcat").string();
+        (std::filesystem::path(tempSessionPath) / "segments_resolved.ffconcat").string();
     if (!BuildResolvedConcatList(concatListPath, resolvedConcatListPath)) {
         std::cout << "Failed to build resolved concat list\n";
         return;
     }
 
-    std::string stitchCmd =
+    std::string finalizeCmd =
         "\"" + ffmpegPath + "\" -y "
         "-f concat -safe 0 -i \"" + resolvedConcatListPath + "\" "
-        "-fflags +genpts "
-        "-c:v h264_nvenc -preset p5 -tune ll -rc cbr -b:v 20M -pix_fmt yuv420p "
-        "\"" + stitchedVideoPath + "\"";
-
-    DWORD stitchCode = 1;
-    if (!RunCommand(stitchCmd, stitchCode)) {
-        std::cout << "Segment stitching failed to start\n";
-        return;
-    }
-
-    if (stitchCode != 0 || !std::filesystem::exists(stitchedVideoPath)) {
-        std::cout << "Segment stitching failed (code " << stitchCode << ")\n";
-        return;
-    }
-
-    // Primary sync source: raw capture timestamps mapped to QPC.
-    const auto qpcToMs = [](long long qpcValue) -> double {
-        if (qpcValue < 0 || qpcFrequency.QuadPart <= 0) {
-            return -1.0;
-        }
-        return (1000.0 * static_cast<double>(qpcValue - sessionStartQpc.QuadPart))
-            / static_cast<double>(qpcFrequency.QuadPart);
-        };
-
-    double audioStartMs = qpcToMs(timing.firstAudioQpc.load(std::memory_order_relaxed));
-    double videoStartMs = qpcToMs(timing.firstVideoQpc.load(std::memory_order_relaxed));
-    double audioEndMs = qpcToMs(timing.lastAudioQpc.load(std::memory_order_relaxed));
-    double videoEndMs = qpcToMs(timing.lastVideoQpc.load(std::memory_order_relaxed));
-    bool usingQpcTiming = (audioStartMs >= 0.0 && videoStartMs >= 0.0 && audioEndMs >= 0.0 && videoEndMs >= 0.0);
-
-    // Fallback for safety if capture-level timestamps are unavailable.
-    StreamPtsInfo videoPts = ProbeStreamPtsMs(
-        ffprobePath, stitchedVideoPath, "v:0", "", "probe_video_pts");
-    StreamPtsInfo audioPts = ProbeStreamPtsMs(
-        ffprobePath, audioPath, "a:0", "", "probe_audio_pts");
-    if (!usingQpcTiming && videoPts.ok && audioPts.ok) {
-        audioStartMs = audioPts.firstPtsMs;
-        videoStartMs = videoPts.firstPtsMs;
-        audioEndMs = audioPts.lastPtsMs;
-        videoEndMs = videoPts.lastPtsMs;
-    }
-
-    double trimAudioStartMs = 0.0;
-    double trimVideoStartMs = 0.0;
-
-    // Deterministic sync from the first valid capture timestamps.
-    double estimatedOffsetMs = 0.0;
-    if (audioStartMs >= 0.0 && videoStartMs >= 0.0) {
-        estimatedOffsetMs = (videoStartMs - audioStartMs);
-    }
-
-    estimatedOffsetMs += audioAdvanceMs;
-
-    if (estimatedOffsetMs > 0.0) {
-        trimAudioStartMs += estimatedOffsetMs;
-    }
-    else {
-        trimVideoStartMs += -estimatedOffsetMs;
-    }
-    if (trimAudioStartMs < 0.0) trimAudioStartMs = 0.0;
-    if (trimVideoStartMs < 0.0) trimVideoStartMs = 0.0;
-
-    std::cout << "A/V timing [ms]: source=" << (usingQpcTiming ? "capture_qpc" : "ffprobe_fallback")
-        << ", audioStart=" << audioStartMs
-        << ", videoStart=" << videoStartMs
-        << ", audioEnd=" << audioEndMs
-        << ", videoEnd=" << videoEndMs
-        << ", estOffset=" << estimatedOffsetMs
-        << ", trimAudio=" << trimAudioStartMs
-        << ", trimVideo=" << trimVideoStartMs << "\n";
-    std::string muxCmd =
-        "\"" + ffmpegPath + "\" -y "
-        "-i \"" + stitchedVideoPath + "\" "
-        "-i \"" + audioPath + "\" "
-        "-filter_complex \"[0:v]trim=start=" + FormatSeconds(trimVideoStartMs / 1000.0) + ",setpts=PTS-STARTPTS[v];"
-        "[1:a]atrim=start=" + FormatSeconds(trimAudioStartMs / 1000.0) + ",asetpts=PTS-STARTPTS[a]\" "
-        "-map \"[v]\" -map \"[a]\" "
-        "-c:v h264_nvenc -preset p5 -tune ll -rc cbr -b:v 20M -pix_fmt yuv420p "
-        "-c:a aac -b:a 192k -shortest "
+        "-fflags +genpts -avoid_negative_ts make_zero "
+        "-c copy "
         "\"" + finalPath + "\"";
 
     DWORD code = 1;
-    if (!RunCommand(muxCmd, code)) {
-        std::cout << "Merge FFmpeg failed\n";
+    if (!RunCommand(finalizeCmd, code)) {
+        std::cout << "Finalizing clip failed to start\n";
         return;
     }
 
     if (code == 0 && std::filesystem::exists(finalPath)) {
-        std::cout << "Merge finished: " << finalPath << "\n";
+        std::cout << "Clip finalized: " << finalPath << "\n";
         std::error_code ec;
         if (std::filesystem::exists(segmentDirPath)) {
             for (const auto& entry : std::filesystem::directory_iterator(segmentDirPath)) {
@@ -481,11 +314,12 @@ void MergeAudioVideo()
         }
         std::filesystem::remove(concatListPath, ec);
         std::filesystem::remove(resolvedConcatListPath, ec);
-        std::filesystem::remove(stitchedVideoPath, ec);
-        std::filesystem::remove(audioPath, ec);
+        if (!tempSessionPath.empty()) {
+            std::filesystem::remove_all(tempSessionPath, ec);
+        }
     }
     else {
-        std::cout << "Merge failed (code " << code << "). Temporary files left.\n";
+        std::cout << "Finalizing failed (code " << code << "). Temporary files left.\n";
     }
 
     videoStarted = false;
@@ -664,10 +498,10 @@ void CleanupTemporaryCaptureFiles()
         std::filesystem::remove(segmentDirPath, ec);
     }
     std::filesystem::remove(concatListPath, ec);
-    std::filesystem::remove((std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId) / "segments_resolved.ffconcat").string(), ec);
-    std::filesystem::remove(stitchedVideoPath, ec);
-    std::filesystem::remove(audioPath, ec);
-    std::filesystem::remove_all((std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId)).string(), ec);
+    std::filesystem::remove((std::filesystem::path(tempSessionPath) / "segments_resolved.ffconcat").string(), ec);
+    if (!tempSessionPath.empty()) {
+        std::filesystem::remove_all(tempSessionPath, ec);
+    }
 }
 
 void Stop(bool saveClip)
@@ -714,10 +548,9 @@ int main()
 {
     bool saveRequested = false;
     replayBufferSeconds = GetReplayBufferSeconds();
-    audioAdvanceMs = GetAudioAdvanceMs();
     std::cout << "=== CS2 Recorder - Fullscreen (60 fps) ===\n\n";
     std::cout << "Replay buffer length: " << replayBufferSeconds << "s\n";
-    std::cout << "Dynamic A/V sync bias: " << audioAdvanceMs << "ms\n";
+    std::cout << "A/V mode: single FFmpeg timeline (shared sync)\n";
     std::cout << "Launch CS2 in Fullscreen mode and wait...\n";
     std::cout << "Save clip hotkey: Alt+F12\n";
 

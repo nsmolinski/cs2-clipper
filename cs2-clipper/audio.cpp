@@ -252,3 +252,189 @@ bool CaptureAudioLoop(
     std::cout << "Audio saved: " << outputPath << "\n";
     return true;
 }
+
+bool GetLoopbackMixFormat(
+    int& sampleRate,
+    int& channels,
+    int& bitsPerSample,
+    bool& isFloat
+)
+{
+    sampleRate = 0;
+    channels = 0;
+    bitsPerSample = 0;
+    isFloat = false;
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool didInitCom = SUCCEEDED(hr);
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IAudioClient* client = nullptr;
+    WAVEFORMATEX* format = nullptr;
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+    if (FAILED(hr) || !enumerator) goto cleanup;
+
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr) || !device) goto cleanup;
+
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
+    if (FAILED(hr) || !client) goto cleanup;
+
+    hr = client->GetMixFormat(&format);
+    if (FAILED(hr) || !format) goto cleanup;
+
+    sampleRate = static_cast<int>(format->nSamplesPerSec);
+    channels = static_cast<int>(format->nChannels);
+    bitsPerSample = static_cast<int>(format->wBitsPerSample);
+    isFloat = (format->wBitsPerSample == 32);
+
+cleanup:
+    if (format) CoTaskMemFree(format);
+    if (client) client->Release();
+    if (device) device->Release();
+    if (enumerator) enumerator->Release();
+    if (didInitCom) CoUninitialize();
+
+    return (sampleRate > 0 && channels > 0 && bitsPerSample > 0);
+}
+
+bool CaptureAudioToPipeLoop(
+    const std::string& pipePath,
+    std::atomic<bool>& runningFlag,
+    CaptureTiming& timing,
+    long long qpcFrequency
+)
+{
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool didInitCom = SUCCEEDED(hr);
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IAudioClient* client = nullptr;
+    IAudioCaptureClient* capture = nullptr;
+    WAVEFORMATEX* format = nullptr;
+    HANDLE pipeHandle = INVALID_HANDLE_VALUE;
+
+    pipeHandle = CreateNamedPipeA(
+        pipePath.c_str(),
+        PIPE_ACCESS_OUTBOUND,
+        PIPE_TYPE_BYTE | PIPE_WAIT,
+        1,
+        1 << 20,
+        1 << 20,
+        0,
+        nullptr
+    );
+    if (pipeHandle == INVALID_HANDLE_VALUE) {
+        std::cout << "Audio pipe create failed\n";
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    if (!ConnectNamedPipe(pipeHandle, nullptr)) {
+        const DWORD err = GetLastError();
+        if (err != ERROR_PIPE_CONNECTED) {
+            std::cout << "Audio pipe connect failed\n";
+            CloseHandle(pipeHandle);
+            if (didInitCom) CoUninitialize();
+            return false;
+        }
+    }
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+    if (FAILED(hr) || !enumerator) goto cleanup;
+
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr) || !device) goto cleanup;
+
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
+    if (FAILED(hr) || !client) goto cleanup;
+
+    hr = client->GetMixFormat(&format);
+    if (FAILED(hr) || !format) goto cleanup;
+
+    hr = client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        10000000,
+        0,
+        format,
+        nullptr
+    );
+    if (FAILED(hr)) goto cleanup;
+
+    hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
+    if (FAILED(hr) || !capture) goto cleanup;
+
+    hr = client->Start();
+    if (FAILED(hr)) goto cleanup;
+
+    while (runningFlag)
+    {
+        UINT32 packetSize = 0;
+        capture->GetNextPacketSize(&packetSize);
+
+        while (packetSize > 0)
+        {
+            BYTE* data = nullptr;
+            UINT32 frames = 0;
+            DWORD flags = 0;
+            UINT64 devicePosition = 0;
+            UINT64 qpcPosition100ns = 0;
+
+            capture->GetBuffer(&data, &frames, &flags, &devicePosition, &qpcPosition100ns);
+
+            const UINT32 bytes = frames * format->nBlockAlign;
+            if (bytes > 0 && data != nullptr) {
+                DWORD written = 0;
+                WriteFile(pipeHandle, data, bytes, &written, nullptr);
+
+                long long packetStartQpc = -1;
+                if (qpcFrequency > 0 && qpcPosition100ns > 0) {
+                    packetStartQpc = static_cast<long long>(
+                        (qpcPosition100ns * static_cast<unsigned long long>(qpcFrequency) + 5000000ULL) / 10000000ULL
+                        );
+                }
+
+                long long packetEndQpc = packetStartQpc;
+                if (packetStartQpc >= 0 && format->nSamplesPerSec > 0 && frames > 0) {
+                    const long long packetDurationQpc =
+                        static_cast<long long>((static_cast<long double>(frames) * static_cast<long double>(qpcFrequency))
+                            / static_cast<long double>(format->nSamplesPerSec));
+                    packetEndQpc = packetStartQpc + packetDurationQpc;
+                }
+
+                LARGE_INTEGER qpcNow{};
+                QueryPerformanceCounter(&qpcNow);
+                const long long effectiveStartQpc = (packetStartQpc >= 0) ? packetStartQpc : qpcNow.QuadPart;
+                const long long effectiveEndQpc = (packetEndQpc >= 0) ? packetEndQpc : qpcNow.QuadPart;
+
+                if (timing.firstAudioQpc.load(std::memory_order_relaxed) < 0) {
+                    timing.firstAudioQpc.store(effectiveStartQpc, std::memory_order_relaxed);
+                }
+                timing.lastAudioQpc.store(effectiveEndQpc, std::memory_order_relaxed);
+            }
+
+            capture->ReleaseBuffer(frames);
+            capture->GetNextPacketSize(&packetSize);
+        }
+
+        Sleep(2);
+    }
+
+cleanup:
+    if (client) client->Stop();
+    if (capture) capture->Release();
+    if (client) client->Release();
+    if (device) device->Release();
+    if (enumerator) enumerator->Release();
+    if (format) CoTaskMemFree(format);
+    if (pipeHandle != INVALID_HANDLE_VALUE) CloseHandle(pipeHandle);
+    if (didInitCom) CoUninitialize();
+
+    return true;
+}
