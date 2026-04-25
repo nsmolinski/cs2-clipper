@@ -5,6 +5,9 @@
 #include <fstream>
 #include <atomic>
 #include <string>
+#include <vector>
+#include <algorithm>
+#include <cstring>
 
 #include "audio.h"
 
@@ -33,7 +36,8 @@ struct WAVHeader
 bool CaptureAudioLoop(
     const std::string& outputPath,
     std::atomic<bool>& runningFlag,
-    CaptureTiming& timing
+    CaptureTiming& timing,
+    int bufferSeconds
 )
 {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -126,19 +130,6 @@ bool CaptureAudioLoop(
         return false;
     }
 
-    std::ofstream file(outputPath, std::ios::binary);
-    if (!file.is_open()) {
-        std::cout << "Audio: can't save file: " << outputPath << "\n";
-        client->Stop();
-        capture->Release();
-        CoTaskMemFree(format);
-        client->Release();
-        device->Release();
-        enumerator->Release();
-        if (didInitCom) CoUninitialize();
-        return false;
-    }
-
     WAVHeader header{};
     header.channels = format->nChannels;
     header.sampleRate = format->nSamplesPerSec;
@@ -147,11 +138,16 @@ bool CaptureAudioLoop(
     header.byteRate = header.sampleRate * header.blockAlign;
     header.dataSize = 0;
 
-    file.write((char*)&header, sizeof(header));
+    if (bufferSeconds <= 0) {
+        bufferSeconds = 15;
+    }
 
-    std::cout << "Audio: recording WAV...\n";
+    const size_t ringCapacityBytes = static_cast<size_t>(header.byteRate) * static_cast<size_t>(bufferSeconds);
+    std::vector<char> ringBuffer(ringCapacityBytes);
+    size_t writePos = 0;
+    size_t bufferedBytes = 0;
 
-    uint32_t totalBytes = 0;
+    std::cout << "Audio: buffering last " << bufferSeconds << " seconds...\n";
 
     while (runningFlag)
     {
@@ -167,7 +163,19 @@ bool CaptureAudioLoop(
             capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
 
             uint32_t bytes = frames * header.blockAlign;
-            file.write((char*)data, bytes);
+            if (bytes > 0 && !ringBuffer.empty()) {
+                const char* src = reinterpret_cast<const char*>(data);
+                size_t bytesLeft = bytes;
+                while (bytesLeft > 0) {
+                    const size_t tailSpace = ringCapacityBytes - writePos;
+                    const size_t chunk = (std::min)(bytesLeft, tailSpace);
+                    memcpy(ringBuffer.data() + writePos, src, chunk);
+                    writePos = (writePos + chunk) % ringCapacityBytes;
+                    src += chunk;
+                    bytesLeft -= chunk;
+                }
+                bufferedBytes = (std::min)(bufferedBytes + static_cast<size_t>(bytes), ringCapacityBytes);
+            }
             if (bytes > 0) {
                 LARGE_INTEGER qpcNow{};
                 QueryPerformanceCounter(&qpcNow);
@@ -176,9 +184,6 @@ bool CaptureAudioLoop(
                 }
                 timing.lastAudioQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
             }
-
-            totalBytes += bytes;
-
             capture->ReleaseBuffer(frames);
             capture->GetNextPacketSize(&packetSize);
         }
@@ -190,11 +195,30 @@ bool CaptureAudioLoop(
 
     client->Stop();
 
-    header.dataSize = totalBytes;
-    header.chunkSize = 36 + totalBytes;
+    std::ofstream file(outputPath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cout << "Audio: can't save file: " << outputPath << "\n";
+        capture->Release();
+        client->Release();
+        device->Release();
+        enumerator->Release();
+        CoTaskMemFree(format);
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
 
-    file.seekp(0);
-    file.write((char*)&header, sizeof(header));
+    header.dataSize = static_cast<uint32_t>(bufferedBytes);
+    header.chunkSize = 36 + header.dataSize;
+    file.write(reinterpret_cast<char*>(&header), sizeof(header));
+
+    if (bufferedBytes > 0 && !ringBuffer.empty()) {
+        const size_t readStart = (writePos + ringCapacityBytes - bufferedBytes) % ringCapacityBytes;
+        const size_t firstPart = (std::min)(bufferedBytes, ringCapacityBytes - readStart);
+        file.write(ringBuffer.data() + readStart, firstPart);
+        if (bufferedBytes > firstPart) {
+            file.write(ringBuffer.data(), bufferedBytes - firstPart);
+        }
+    }
 
     capture->Release();
     client->Release();
