@@ -1,0 +1,209 @@
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <iostream>
+#include <fstream>
+#include <atomic>
+#include <string>
+
+#include "audio.h"
+
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+
+struct WAVHeader
+{
+    char riff[4] = { 'R','I','F','F' };
+    uint32_t chunkSize;
+    char wave[4] = { 'W','A','V','E' };
+
+    char fmt[4] = { 'f','m','t',' ' };
+    uint32_t fmtSize = 16;
+    uint16_t audioFormat = 3; // FLOAT
+    uint16_t channels;
+    uint32_t sampleRate;
+    uint32_t byteRate;
+    uint16_t blockAlign;
+    uint16_t bitsPerSample;
+
+    char data[4] = { 'd','a','t','a' };
+    uint32_t dataSize;
+};
+
+bool CaptureAudioLoop(
+    const std::string& outputPath,
+    std::atomic<bool>& runningFlag,
+    CaptureTiming& timing
+)
+{
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool didInitCom = SUCCEEDED(hr);
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IAudioClient* client = nullptr;
+    IAudioCaptureClient* capture = nullptr;
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+    if (FAILED(hr) || !enumerator) {
+        std::cout << "Audio: can't create MMDeviceEnumerator\n";
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr) || !device) {
+        std::cout << "Audio: no audio device\n";
+        enumerator->Release();
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
+    if (FAILED(hr) || !client) {
+        std::cout << "Audio: can't activate IAudioClient\n";
+        device->Release();
+        enumerator->Release();
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    WAVEFORMATEX* format = nullptr;
+    hr = client->GetMixFormat(&format);
+    if (FAILED(hr) || !format) {
+        std::cout << "Audio: GetMixFormat failed\n";
+        client->Release();
+        device->Release();
+        enumerator->Release();
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    std::cout << "=== AUDIO FORMAT ===\n";
+    std::cout << "Channels: " << format->nChannels << "\n";
+    std::cout << "SampleRate: " << format->nSamplesPerSec << "\n";
+    std::cout << "Bits: " << format->wBitsPerSample << "\n\n";
+
+    hr = client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        10000000,
+        0,
+        format,
+        nullptr
+    );
+    if (FAILED(hr)) {
+        std::cout << "Audio: Initialize loopback failed\n";
+        CoTaskMemFree(format);
+        client->Release();
+        device->Release();
+        enumerator->Release();
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
+    if (FAILED(hr) || !capture) {
+        std::cout << "Audio: GetService(IAudioCaptureClient) failed\n";
+        CoTaskMemFree(format);
+        client->Release();
+        device->Release();
+        enumerator->Release();
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    hr = client->Start();
+    if (FAILED(hr)) {
+        std::cout << "Audio: Start failed\n";
+        capture->Release();
+        CoTaskMemFree(format);
+        client->Release();
+        device->Release();
+        enumerator->Release();
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    std::ofstream file(outputPath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cout << "Audio: can't save file: " << outputPath << "\n";
+        client->Stop();
+        capture->Release();
+        CoTaskMemFree(format);
+        client->Release();
+        device->Release();
+        enumerator->Release();
+        if (didInitCom) CoUninitialize();
+        return false;
+    }
+
+    WAVHeader header{};
+    header.channels = format->nChannels;
+    header.sampleRate = format->nSamplesPerSec;
+    header.bitsPerSample = format->wBitsPerSample;
+    header.blockAlign = header.channels * header.bitsPerSample / 8;
+    header.byteRate = header.sampleRate * header.blockAlign;
+    header.dataSize = 0;
+
+    file.write((char*)&header, sizeof(header));
+
+    std::cout << "Audio: recording WAV...\n";
+
+    uint32_t totalBytes = 0;
+
+    while (runningFlag)
+    {
+        UINT32 packetSize = 0;
+        capture->GetNextPacketSize(&packetSize);
+
+        while (packetSize > 0)
+        {
+            BYTE* data;
+            UINT32 frames;
+            DWORD flags;
+
+            capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+
+            uint32_t bytes = frames * header.blockAlign;
+            file.write((char*)data, bytes);
+            if (bytes > 0) {
+                LARGE_INTEGER qpcNow{};
+                QueryPerformanceCounter(&qpcNow);
+                if (timing.firstAudioQpc.load(std::memory_order_relaxed) < 0) {
+                    timing.firstAudioQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+                }
+                timing.lastAudioQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+            }
+
+            totalBytes += bytes;
+
+            capture->ReleaseBuffer(frames);
+            capture->GetNextPacketSize(&packetSize);
+        }
+
+        Sleep(2);
+    }
+
+    std::cout << "Audio: stop\n";
+
+    client->Stop();
+
+    header.dataSize = totalBytes;
+    header.chunkSize = 36 + totalBytes;
+
+    file.seekp(0);
+    file.write((char*)&header, sizeof(header));
+
+    capture->Release();
+    client->Release();
+    device->Release();
+    enumerator->Release();
+
+    CoTaskMemFree(format);
+    if (didInitCom) CoUninitialize();
+
+    std::cout << "Audio saved: " << outputPath << "\n";
+    return true;
+}

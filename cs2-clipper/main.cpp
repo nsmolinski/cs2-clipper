@@ -7,10 +7,15 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <string>
+#include <sstream>
+#include <iomanip>
+
+#include "audio.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
-
+  
 ID3D11Device* device = nullptr;
 ID3D11DeviceContext* context = nullptr;
 IDXGIOutputDuplication* duplication = nullptr;
@@ -21,6 +26,22 @@ PROCESS_INFORMATION ffmpegProc{};
 
 int WIDTH = 0, HEIGHT = 0;
 std::atomic<bool> running{ true };
+std::atomic<bool> audioRunning{ false };
+std::thread audioThread;
+
+std::string ffmpegPath;
+std::string videoPath;
+std::string audioPath;
+std::string finalPath;
+std::string sessionId;
+bool videoStarted = false;
+bool audioStarted = false;
+CaptureTiming timing;
+LARGE_INTEGER qpcFrequency{};
+LARGE_INTEGER sessionStartQpc{};
+constexpr int kAudioPrerollMs = 220;
+constexpr int kAudioWarmupTimeoutMs = 1200;
+constexpr double kAudioLateMicroCompensationMs = 12.0;
 
 HWND cs2Window = nullptr;
 RECT cs2Rect{};
@@ -28,33 +49,38 @@ int captureX = 0, captureY = 0;
 int captureWidth = 0, captureHeight = 0;
 
 uint64_t lastPresentTime = 0;
-std::chrono::steady_clock::time_point lastSentTime = std::chrono::steady_clock::now();
 
 std::string FindFFmpeg()
 {
     auto path = std::filesystem::current_path() / "ffmpeg" / "bin" / "ffmpeg.exe";
-    std::cout << "Szukam FFmpeg: " << path << std::endl;
+    std::cout << "Searching for FFmpeg: " << path << std::endl;
     return std::filesystem::exists(path) ? path.string() : "";
 }
 
-std::string OutputPath()
+std::string BuildSessionId()
+{
+    return std::to_string(std::time(nullptr));
+}
+
+void PrepareOutputPaths()
 {
     std::filesystem::create_directories("C:\\CS2Recordings");
-    return "C:\\CS2Recordings\\cs2_recording_" + std::to_string(std::time(nullptr)) + ".mp4";
+    sessionId = BuildSessionId();
+    videoPath = "C:\\CS2Recordings\\video_" + sessionId + ".mp4";
+    audioPath = "C:\\CS2Recordings\\audio_" + sessionId + ".wav";
+    finalPath = "C:\\CS2Recordings\\cs2_recording_" + sessionId + ".mp4";
 }
 
 void StartFFmpeg()
 {
-    std::string ffmpeg = FindFFmpeg();
-    if (ffmpeg.empty()) {
-        std::cout << "FFmpeg nie znaleziony!\n";
+    ffmpegPath = FindFFmpeg();
+    if (ffmpegPath.empty()) {
+        std::cout << "FFmpeg not found\n";
         return;
     }
 
-    std::string out = OutputPath();
-
     std::string cmd =
-        "\"" + ffmpeg + "\" -y "
+        "\"" + ffmpegPath + "\" -y "
         "-f rawvideo -pix_fmt bgra "
         "-s " + std::to_string(WIDTH) + "x" + std::to_string(HEIGHT) + " "
         "-r 60 -i - "
@@ -69,9 +95,9 @@ void StartFFmpeg()
         "-rc cbr "
         "-b:v 20M "
         "-pix_fmt yuv420p "
-        "\"" + out + "\"";
+        "\"" + videoPath + "\"";
 
-    std::cout << "Uruchamiam FFmpeg (stabilne 60 fps dla Fullscreen)...\n";
+    std::cout << "Launching FFmpeg (60 fps fullscreen)...\n";
 
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
     HANDLE r = nullptr, w = nullptr;
@@ -89,6 +115,115 @@ void StartFFmpeg()
     CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &ffmpegProc);
     CloseHandle(r);
     ffmpegIn = w;
+    videoStarted = true;
+}
+
+void StartAudio()
+{
+    if (audioRunning) return;
+    audioRunning = true;
+    audioStarted = true;
+    audioThread = std::thread([] {
+        CaptureAudioLoop(audioPath, audioRunning, timing);
+    });
+}
+
+void StopAudio()
+{
+    if (!audioRunning && !audioThread.joinable()) return;
+
+    audioRunning = false;
+    if (audioThread.joinable()) {
+        audioThread.join();
+    }
+}
+
+void MergeAudioVideo()
+{
+    if (ffmpegPath.empty()) return;
+    if (!std::filesystem::exists(videoPath) || !std::filesystem::exists(audioPath)) {
+        std::cout << "Skipping merging - missing audio or video file.\n";
+        return;
+    }
+
+    const auto qpcToMs = [](long long qpcValue) -> double {
+        if (qpcValue < 0 || qpcFrequency.QuadPart <= 0) {
+            return -1.0;
+        }
+        return (1000.0 * static_cast<double>(qpcValue - sessionStartQpc.QuadPart))
+            / static_cast<double>(qpcFrequency.QuadPart);
+    };
+    const auto secString = [](double ms) -> std::string {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(3) << (ms / 1000.0);
+        return ss.str();
+    };
+
+    const double audioStartMs = qpcToMs(timing.firstAudioQpc.load(std::memory_order_relaxed));
+    const double videoStartMs = qpcToMs(timing.firstVideoQpc.load(std::memory_order_relaxed));
+    const double audioEndMs = qpcToMs(timing.lastAudioQpc.load(std::memory_order_relaxed));
+    const double videoEndMs = qpcToMs(timing.lastVideoQpc.load(std::memory_order_relaxed));
+
+    double trimAudioStartMs = 0.0;
+    double trimVideoStartMs = 0.0;
+    if (audioStartMs >= 0.0 && videoStartMs >= 0.0) {
+        if (audioStartMs > videoStartMs) {
+            trimVideoStartMs = audioStartMs - videoStartMs;
+        }
+        else {
+            trimAudioStartMs = videoStartMs - audioStartMs;
+        }
+    }
+    trimVideoStartMs += kAudioLateMicroCompensationMs;
+
+    std::cout << "A/V timing [ms]: audioStart=" << audioStartMs
+        << ", videoStart=" << videoStartMs
+        << ", audioEnd=" << audioEndMs
+        << ", videoEnd=" << videoEndMs
+        << ", trimAudio=" << trimAudioStartMs
+        << ", trimVideo=" << trimVideoStartMs << "\n";
+
+    std::string cmd =
+        "\"" + ffmpegPath + "\" -y "
+        "-ss " + secString(trimVideoStartMs) + " -i \"" + videoPath + "\" "
+        "-ss " + secString(trimAudioStartMs) + " -i \"" + audioPath + "\" "
+        "-c:v copy -c:a aac -b:a 192k -af aresample=async=1:first_pts=0 -shortest "
+        "\"" + finalPath + "\"";
+
+    STARTUPINFOA si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+
+    std::vector<char> buf(cmd.begin(), cmd.end());
+    buf.push_back('\0');
+
+    if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        std::cout << "Merge FFmpeg failed\n";
+        return;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (code == 0 && std::filesystem::exists(finalPath)) {
+        std::cout << "Merge finished: " << finalPath << "\n";
+        std::error_code ec;
+        std::filesystem::remove(videoPath, ec);
+        std::filesystem::remove(audioPath, ec);
+    }
+    else {
+        std::cout << "Merge failed (code " << code << "). Temporary files left.\n";
+    }
+
+    videoStarted = false;
+    audioStarted = false;
+    timing.firstAudioQpc.store(-1, std::memory_order_relaxed);
+    timing.lastAudioQpc.store(-1, std::memory_order_relaxed);
+    timing.firstVideoQpc.store(-1, std::memory_order_relaxed);
+    timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
 }
 
 bool InitDXGI()
@@ -103,7 +238,7 @@ bool InitDXGI()
         &device, nullptr, &context);
 
     if (FAILED(hr)) {
-        std::cout << "D3D11CreateDevice nie powiodło się!\n";
+        std::cout << "D3D11CreateDevice failed\n";
         return false;
     }
 
@@ -126,7 +261,7 @@ bool InitDXGI()
     output1->Release();
 
     if (FAILED(hr)) {
-        std::cout << "DuplicateOutput nie powiodło się (hr = 0x" << std::hex << hr << ")\n";
+        std::cout << "DuplicateOutput failed (hr = 0x" << std::hex << hr << ")\n";
         return false;
     }
 
@@ -135,7 +270,7 @@ bool InitDXGI()
     WIDTH = desc.ModeDesc.Width;
     HEIGHT = desc.ModeDesc.Height;
 
-    std::cout << "DXGI gotowy (" << WIDTH << "x" << HEIGHT << ")\n";
+    std::cout << "DXGI completed (" << WIDTH << "x" << HEIGHT << ")\n";
     return true;
 }
 
@@ -226,6 +361,14 @@ void CaptureFrame()
                 &written,
                 nullptr
             );
+            if (written > 0) {
+                LARGE_INTEGER qpcNow{};
+                QueryPerformanceCounter(&qpcNow);
+                if (timing.firstVideoQpc.load(std::memory_order_relaxed) < 0) {
+                    timing.firstVideoQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+                }
+                timing.lastVideoQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+            }
 
             context->Unmap(staging, 0);
         }
@@ -238,7 +381,7 @@ void CaptureFrame()
 
 void Stop()
 {
-    std::cout << "Zatrzymywanie nagrywania...\n";
+    std::cout << "Stoping recording...\n";
 
     if (ffmpegIn)
     {
@@ -246,6 +389,8 @@ void Stop()
         CloseHandle(ffmpegIn);
         ffmpegIn = nullptr;
     }
+
+    StopAudio();
 
     if (ffmpegProc.hProcess)
     {
@@ -258,12 +403,14 @@ void Stop()
     if (duplication) { duplication->Release(); duplication = nullptr; }
     if (context) { context->Release();     context = nullptr; }
     if (device) { device->Release();      device = nullptr; }
+
+    MergeAudioVideo();
 }
 
 int main()
 {
-    std::cout << "=== CS2 Recorder - Fullscreen (stabilne 60 fps) ===\n\n";
-    std::cout << "Uruchom CS2 w trybie Fullscreen i czekaj...\n";
+    std::cout << "=== CS2 Recorder - Fullscreen (60 fps) ===\n\n";
+    std::cout << "Launch CS2 in Fullscreen mode and wait...\n";
 
     while (running)
     {
@@ -274,11 +421,35 @@ int main()
         {
             if (UpdateCS2Window())
             {
-                std::cout << "CS2 znaleziony! Rozmiar: " << captureWidth << "x" << captureHeight << "\n";
+                std::cout << "CS2 found, resolution: " << captureWidth << "x" << captureHeight << "\n";
                 if (InitDXGI())
                 {
+                    QueryPerformanceFrequency(&qpcFrequency);
+                    QueryPerformanceCounter(&sessionStartQpc);
                     CreateStaging();
+                    PrepareOutputPaths();
+                    timing.firstAudioQpc.store(-1, std::memory_order_relaxed);
+                    timing.lastAudioQpc.store(-1, std::memory_order_relaxed);
+                    timing.firstVideoQpc.store(-1, std::memory_order_relaxed);
+                    timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
+                    StartAudio();
+                    if (audioRunning) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(kAudioPrerollMs));
+                        const auto waitStart = std::chrono::steady_clock::now();
+                        while (audioRunning && timing.firstAudioQpc.load(std::memory_order_relaxed) < 0) {
+                            const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - waitStart).count();
+                            if (waitedMs >= kAudioWarmupTimeoutMs) {
+                                std::cout << "Audio warmup timeout - startuje video mimo braku pierwszego pakietu\n";
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        }
+                    }
                     StartFFmpeg();
+                    if (!ffmpegIn) {
+                        StopAudio();
+                    }
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -291,7 +462,7 @@ int main()
 
         if ((current.right - current.left != captureWidth) || (current.bottom - current.top != captureHeight))
         {
-            std::cout << "Rozmiar CS2 zmieniony - restart nagrywania...\n";
+            std::cout << "CS2 window resolution changed - restarting recording...\n";
             Stop();
             cs2Window = nullptr;
             continue;
@@ -303,6 +474,6 @@ int main()
     }
 
     Stop();
-    std::cout << "Nagrywanie zakończone. Pliki znajdują się w C:\\CS2Recordings\n";
+    std::cout << "Recording finished. Result: " << finalPath << "\n";
     return 0;
 }
