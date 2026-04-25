@@ -15,5 +15,6 @@ bool CaptureAudioLoop(
     const std::string& outputPath,
     std::atomic<bool>& runningFlag,
     CaptureTiming& timing,
-    int bufferSeconds
+    int bufferSeconds,
+    long long qpcFrequency
 );

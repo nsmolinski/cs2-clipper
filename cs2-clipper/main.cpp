@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <cstdlib>
 #include <cmath>
+#include <cstdio>
 
 #include "audio.h"
 
@@ -33,12 +34,12 @@ std::atomic<bool> audioRunning{ false };
 std::thread audioThread;
 
 std::string ffmpegPath;
+std::string ffprobePath;
 std::string segmentDirPath;
 std::string audioPath;
 std::string stitchedVideoPath;
 std::string finalPath;
 std::string concatListPath;
-std::string mergeLogPath;
 std::string sessionId;
 bool videoStarted = false;
 bool audioStarted = false;
@@ -47,6 +48,7 @@ LARGE_INTEGER qpcFrequency{};
 LARGE_INTEGER sessionStartQpc{};
 constexpr int kDefaultReplayBufferSeconds = 15;
 constexpr double kDynamicSyncBiasMs = 0.0;
+constexpr int kCaptureStartDelayMs = 1000;
 
 HWND cs2Window = nullptr;
 RECT cs2Rect{};
@@ -85,6 +87,12 @@ std::string FindFFmpeg()
     return std::filesystem::exists(path) ? path.string() : "";
 }
 
+std::string FindFFprobe()
+{
+    auto path = std::filesystem::current_path() / "ffmpeg" / "bin" / "ffprobe.exe";
+    return std::filesystem::exists(path) ? path.string() : "";
+}
+
 std::string FormatSeconds(double seconds)
 {
     std::ostringstream ss;
@@ -100,6 +108,95 @@ std::string BuildSessionId()
 double GetAudioAdvanceMs()
 {
     return kDynamicSyncBiasMs;
+}
+
+struct StreamPtsInfo
+{
+    bool ok = false;
+    double firstPtsMs = -1.0;
+    double lastPtsMs = -1.0;
+    int sampleCount = 0;
+};
+
+StreamPtsInfo ProbeStreamPtsMs(
+    const std::string& ffprobeExePath,
+    const std::string& mediaPath,
+    const std::string& streamSelector,
+    const std::string& logPath,
+    const std::string& stageLabel)
+{
+    StreamPtsInfo info{};
+    if (ffprobeExePath.empty() || mediaPath.empty()) {
+        return info;
+    }
+
+    std::string cmd =
+        "\"" + ffprobeExePath + "\" -v error "
+        "-select_streams " + streamSelector + " "
+        "-show_entries packet=pts_time "
+        "-of default=noprint_wrappers=1:nokey=1 "
+        "\"" + mediaPath + "\"";
+
+    const bool canLog = !logPath.empty();
+    if (canLog) {
+        std::ofstream log(logPath, std::ios::app);
+        if (log.is_open()) {
+            log << "\n==== " << stageLabel << " ====\n";
+            log << cmd << "\n";
+        }
+    }
+
+    FILE* pipe = _popen(cmd.c_str(), "r");
+    if (!pipe) {
+        if (canLog) {
+            std::ofstream log(logPath, std::ios::app);
+            if (log.is_open()) {
+                log << "ffprobe popen failed\n";
+            }
+        }
+        return info;
+    }
+
+    char buffer[256]{};
+    while (fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
+        std::string line(buffer);
+        // Trim whitespace/newline.
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+            line.pop_back();
+        }
+        if (line.empty() || line == "N/A") {
+            continue;
+        }
+
+        try {
+            const double ptsSeconds = std::stod(line);
+            const double ptsMs = ptsSeconds * 1000.0;
+            if (info.firstPtsMs < 0.0) {
+                info.firstPtsMs = ptsMs;
+            }
+            info.lastPtsMs = ptsMs;
+            info.sampleCount++;
+        }
+        catch (...) {
+            // Ignore malformed lines.
+        }
+    }
+
+    const int probeExitCode = _pclose(pipe);
+    info.ok = (probeExitCode == 0 && info.sampleCount > 0);
+
+    if (canLog) {
+        std::ofstream log(logPath, std::ios::app);
+        if (log.is_open()) {
+            log << "ffprobe result (" << stageLabel << "): exit=" << probeExitCode
+                << ", ok=" << (info.ok ? "true" : "false")
+                << ", samples=" << info.sampleCount
+                << ", firstPtsMs=" << info.firstPtsMs
+                << ", lastPtsMs=" << info.lastPtsMs << "\n";
+        }
+    }
+
+    return info;
 }
 
 bool BuildResolvedConcatList(const std::string& sourcePath, const std::string& targetPath)
@@ -146,18 +243,9 @@ bool BuildResolvedConcatList(const std::string& sourcePath, const std::string& t
     return writtenFiles > 0;
 }
 
-bool RunLoggedCommand(const std::string& command, const std::string& logPath, const std::string& stage, DWORD& exitCode)
+bool RunCommand(const std::string& command, DWORD& exitCode)
 {
-    {
-        std::ofstream log(logPath, std::ios::app);
-        if (log.is_open()) {
-            log << "\n==== " << stage << " ====\n";
-            log << command << "\n";
-        }
-    }
-
-    std::string wrapped =
-        "cmd.exe /C \"(" + command + ") >> \"" + logPath + "\" 2>&1\"";
+    std::string wrapped = "cmd.exe /C \"" + command + "\"";
 
     STARTUPINFOA si{};
     PROCESS_INFORMATION pi{};
@@ -167,13 +255,7 @@ bool RunLoggedCommand(const std::string& command, const std::string& logPath, co
     buf.push_back('\0');
 
     if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        {
-            std::ofstream log(logPath, std::ios::app);
-            if (log.is_open()) {
-                log << "CreateProcess failed for stage " << stage
-                    << ", error=" << GetLastError() << "\n";
-            }
-        }
+        std::cout << "CreateProcess failed, error=" << GetLastError() << "\n";
         return false;
     }
 
@@ -189,18 +271,20 @@ void PrepareOutputPaths()
 {
     std::filesystem::create_directories("C:\\CS2Recordings");
     sessionId = BuildSessionId();
-    segmentDirPath = "C:\\CS2Recordings\\segments_" + sessionId;
+    std::filesystem::path tempBase = std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId);
+    std::filesystem::create_directories(tempBase);
+    segmentDirPath = (tempBase / "segments").string();
     audioPath = "C:\\CS2Recordings\\audio_" + sessionId + ".wav";
     stitchedVideoPath = "C:\\CS2Recordings\\video_stitched_" + sessionId + ".mp4";
     finalPath = "C:\\CS2Recordings\\cs2_recording_" + sessionId + ".mp4";
-    concatListPath = "C:\\CS2Recordings\\segments_" + sessionId + ".txt";
-    mergeLogPath = "C:\\CS2Recordings\\merge_" + sessionId + ".log";
+    concatListPath = (tempBase / "segments.ffconcat").string();
     std::filesystem::create_directories(segmentDirPath);
 }
 
 void StartFFmpeg()
 {
     ffmpegPath = FindFFmpeg();
+    ffprobePath = FindFFprobe();
     if (ffmpegPath.empty()) {
         std::cout << "FFmpeg not found\n";
         return;
@@ -263,7 +347,7 @@ void StartAudio()
     audioRunning = true;
     audioStarted = true;
     audioThread = std::thread([] {
-        CaptureAudioLoop(audioPath, audioRunning, timing, replayBufferSeconds);
+        CaptureAudioLoop(audioPath, audioRunning, timing, replayBufferSeconds, qpcFrequency.QuadPart);
     });
 }
 
@@ -289,17 +373,11 @@ void MergeAudioVideo()
         return;
     }
     std::cout << "Merging replay buffer using FFmpeg segment list + audio\n";
-    const std::string resolvedConcatListPath = "C:\\CS2Recordings\\segments_" + sessionId + "_resolved.txt";
+    const std::string resolvedConcatListPath =
+        (std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId) / "segments_resolved.ffconcat").string();
     if (!BuildResolvedConcatList(concatListPath, resolvedConcatListPath)) {
         std::cout << "Failed to build resolved concat list\n";
         return;
-    }
-    {
-        std::ofstream log(mergeLogPath, std::ios::trunc);
-        if (log.is_open()) {
-            log << "Session: " << sessionId << "\n";
-            log << "Replay buffer seconds: " << replayBufferSeconds << "\n";
-        }
     }
 
     std::string stitchCmd =
@@ -310,57 +388,50 @@ void MergeAudioVideo()
         "\"" + stitchedVideoPath + "\"";
 
     DWORD stitchCode = 1;
-    if (!RunLoggedCommand(stitchCmd, mergeLogPath, "stitch_segments", stitchCode)) {
+    if (!RunCommand(stitchCmd, stitchCode)) {
         std::cout << "Segment stitching failed to start\n";
-        std::cout << "Merge log: " << mergeLogPath << "\n";
         return;
     }
 
     if (stitchCode != 0 || !std::filesystem::exists(stitchedVideoPath)) {
         std::cout << "Segment stitching failed (code " << stitchCode << ")\n";
-        std::cout << "Merge log: " << mergeLogPath << "\n";
         return;
     }
 
+    // Primary sync source: raw capture timestamps mapped to QPC.
     const auto qpcToMs = [](long long qpcValue) -> double {
         if (qpcValue < 0 || qpcFrequency.QuadPart <= 0) {
             return -1.0;
         }
         return (1000.0 * static_cast<double>(qpcValue - sessionStartQpc.QuadPart))
             / static_cast<double>(qpcFrequency.QuadPart);
-    };
+        };
 
-    const double audioStartMs = qpcToMs(timing.firstAudioQpc.load(std::memory_order_relaxed));
-    const double videoStartMs = qpcToMs(timing.firstVideoQpc.load(std::memory_order_relaxed));
-    const double audioEndMs = qpcToMs(timing.lastAudioQpc.load(std::memory_order_relaxed));
-    const double videoEndMs = qpcToMs(timing.lastVideoQpc.load(std::memory_order_relaxed));
+    double audioStartMs = qpcToMs(timing.firstAudioQpc.load(std::memory_order_relaxed));
+    double videoStartMs = qpcToMs(timing.firstVideoQpc.load(std::memory_order_relaxed));
+    double audioEndMs = qpcToMs(timing.lastAudioQpc.load(std::memory_order_relaxed));
+    double videoEndMs = qpcToMs(timing.lastVideoQpc.load(std::memory_order_relaxed));
+    bool usingQpcTiming = (audioStartMs >= 0.0 && videoStartMs >= 0.0 && audioEndMs >= 0.0 && videoEndMs >= 0.0);
+
+    // Fallback for safety if capture-level timestamps are unavailable.
+    StreamPtsInfo videoPts = ProbeStreamPtsMs(
+        ffprobePath, stitchedVideoPath, "v:0", "", "probe_video_pts");
+    StreamPtsInfo audioPts = ProbeStreamPtsMs(
+        ffprobePath, audioPath, "a:0", "", "probe_audio_pts");
+    if (!usingQpcTiming && videoPts.ok && audioPts.ok) {
+        audioStartMs = audioPts.firstPtsMs;
+        videoStartMs = videoPts.firstPtsMs;
+        audioEndMs = audioPts.lastPtsMs;
+        videoEndMs = videoPts.lastPtsMs;
+    }
 
     double trimAudioStartMs = 0.0;
     double trimVideoStartMs = 0.0;
 
-    // Automatic sync (no hardcode):
-    // - primary signal: end delta (replay buffer correctness)
-    // - optional start delta only if it is close to end delta
+    // Deterministic sync from the first valid capture timestamps.
     double estimatedOffsetMs = 0.0;
-    double endDeltaMs = 0.0;
-    bool hasEndDelta = false;
-    if (audioEndMs >= 0.0 && videoEndMs >= 0.0) {
-        endDeltaMs = (videoEndMs - audioEndMs);
-        estimatedOffsetMs = endDeltaMs;
-        hasEndDelta = true;
-    }
-
     if (audioStartMs >= 0.0 && videoStartMs >= 0.0) {
-        const double startDeltaMs = (videoStartMs - audioStartMs);
-        if (!hasEndDelta) {
-            estimatedOffsetMs = startDeltaMs;
-        }
-        else {
-            // Ignore session-start warmup skew unless start/end tell similar story.
-            if (std::abs(startDeltaMs - endDeltaMs) <= 120.0) {
-                estimatedOffsetMs = (0.25 * startDeltaMs) + (0.75 * endDeltaMs);
-            }
-        }
+        estimatedOffsetMs = (videoStartMs - audioStartMs);
     }
 
     estimatedOffsetMs += audioAdvanceMs;
@@ -374,47 +445,33 @@ void MergeAudioVideo()
     if (trimAudioStartMs < 0.0) trimAudioStartMs = 0.0;
     if (trimVideoStartMs < 0.0) trimVideoStartMs = 0.0;
 
-    std::cout << "A/V timing [ms]: audioStart=" << audioStartMs
+    std::cout << "A/V timing [ms]: source=" << (usingQpcTiming ? "capture_qpc" : "ffprobe_fallback")
+        << ", audioStart=" << audioStartMs
         << ", videoStart=" << videoStartMs
         << ", audioEnd=" << audioEndMs
         << ", videoEnd=" << videoEndMs
         << ", estOffset=" << estimatedOffsetMs
         << ", trimAudio=" << trimAudioStartMs
         << ", trimVideo=" << trimVideoStartMs << "\n";
-    {
-        std::ofstream log(mergeLogPath, std::ios::app);
-        if (log.is_open()) {
-            log << "A/V timing [ms]: audioStart=" << audioStartMs
-                << ", videoStart=" << videoStartMs
-                << ", audioEnd=" << audioEndMs
-                << ", videoEnd=" << videoEndMs
-                << ", estOffset=" << estimatedOffsetMs
-                << ", trimAudio=" << trimAudioStartMs
-                << ", trimVideo=" << trimVideoStartMs << "\n";
-        }
-    }
-
     std::string muxCmd =
         "\"" + ffmpegPath + "\" -y "
         "-i \"" + stitchedVideoPath + "\" "
         "-i \"" + audioPath + "\" "
         "-filter_complex \"[0:v]trim=start=" + FormatSeconds(trimVideoStartMs / 1000.0) + ",setpts=PTS-STARTPTS[v];"
-        "[1:a]atrim=start=" + FormatSeconds(trimAudioStartMs / 1000.0) + ",asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a]\" "
+        "[1:a]atrim=start=" + FormatSeconds(trimAudioStartMs / 1000.0) + ",asetpts=PTS-STARTPTS[a]\" "
         "-map \"[v]\" -map \"[a]\" "
         "-c:v h264_nvenc -preset p5 -tune ll -rc cbr -b:v 20M -pix_fmt yuv420p "
         "-c:a aac -b:a 192k -shortest "
         "\"" + finalPath + "\"";
 
     DWORD code = 1;
-    if (!RunLoggedCommand(muxCmd, mergeLogPath, "mux_audio_video", code)) {
+    if (!RunCommand(muxCmd, code)) {
         std::cout << "Merge FFmpeg failed\n";
-        std::cout << "Merge log: " << mergeLogPath << "\n";
         return;
     }
 
     if (code == 0 && std::filesystem::exists(finalPath)) {
         std::cout << "Merge finished: " << finalPath << "\n";
-        std::cout << "Merge log: " << mergeLogPath << "\n";
         std::error_code ec;
         if (std::filesystem::exists(segmentDirPath)) {
             for (const auto& entry : std::filesystem::directory_iterator(segmentDirPath)) {
@@ -575,12 +632,17 @@ void CaptureFrame()
                 nullptr
             );
             if (written > 0) {
-                LARGE_INTEGER qpcNow{};
-                QueryPerformanceCounter(&qpcNow);
+                const long long frameQpc = (info.LastPresentTime.QuadPart > 0)
+                    ? info.LastPresentTime.QuadPart
+                    : [] {
+                    LARGE_INTEGER qpcNow{};
+                    QueryPerformanceCounter(&qpcNow);
+                    return qpcNow.QuadPart;
+                }();
                 if (timing.firstVideoQpc.load(std::memory_order_relaxed) < 0) {
-                    timing.firstVideoQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+                    timing.firstVideoQpc.store(frameQpc, std::memory_order_relaxed);
                 }
-                timing.lastVideoQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+                timing.lastVideoQpc.store(frameQpc, std::memory_order_relaxed);
             }
 
             context->Unmap(staging, 0);
@@ -592,7 +654,23 @@ void CaptureFrame()
     res->Release();
 }
 
-void Stop()
+void CleanupTemporaryCaptureFiles()
+{
+    std::error_code ec;
+    if (std::filesystem::exists(segmentDirPath)) {
+        for (const auto& entry : std::filesystem::directory_iterator(segmentDirPath)) {
+            std::filesystem::remove(entry.path(), ec);
+        }
+        std::filesystem::remove(segmentDirPath, ec);
+    }
+    std::filesystem::remove(concatListPath, ec);
+    std::filesystem::remove((std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId) / "segments_resolved.ffconcat").string(), ec);
+    std::filesystem::remove(stitchedVideoPath, ec);
+    std::filesystem::remove(audioPath, ec);
+    std::filesystem::remove_all((std::filesystem::temp_directory_path() / ("cs2-clipper-" + sessionId)).string(), ec);
+}
+
+void Stop(bool saveClip)
 {
     std::cout << "Stoping recording...\n";
 
@@ -617,11 +695,24 @@ void Stop()
     if (context) { context->Release();     context = nullptr; }
     if (device) { device->Release();      device = nullptr; }
 
-    MergeAudioVideo();
+    if (saveClip) {
+        MergeAudioVideo();
+    }
+    else {
+        std::cout << "Capture stopped without saving clip.\n";
+        CleanupTemporaryCaptureFiles();
+        videoStarted = false;
+        audioStarted = false;
+        timing.firstAudioQpc.store(-1, std::memory_order_relaxed);
+        timing.lastAudioQpc.store(-1, std::memory_order_relaxed);
+        timing.firstVideoQpc.store(-1, std::memory_order_relaxed);
+        timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
+    }
 }
 
 int main()
 {
+    bool saveRequested = false;
     replayBufferSeconds = GetReplayBufferSeconds();
     audioAdvanceMs = GetAudioAdvanceMs();
     std::cout << "=== CS2 Recorder - Fullscreen (60 fps) ===\n\n";
@@ -636,16 +727,25 @@ int main()
         const bool f12PressedNow = (GetAsyncKeyState(VK_F12) & 0x0001) != 0;
         if (altHeld && f12PressedNow) {
             std::cout << "Alt+F12 detected - saving clip...\n";
+            saveRequested = true;
             break;
         }
 
         if (!cs2Window || !IsWindow(cs2Window))
         {
+            if (videoStarted || audioStarted || ffmpegIn || audioRunning) {
+                std::cout << "CS2 closed/lost - stopping without save.\n";
+                Stop(false);
+            }
+
             if (UpdateCS2Window())
             {
                 std::cout << "CS2 found, resolution: " << captureWidth << "x" << captureHeight << "\n";
                 if (InitDXGI())
                 {
+                    std::cout << "Arming replay buffer in " << kCaptureStartDelayMs << "ms...\n";
+                    std::this_thread::sleep_for(std::chrono::milliseconds(kCaptureStartDelayMs));
+
                     QueryPerformanceFrequency(&qpcFrequency);
                     QueryPerformanceCounter(&sessionStartQpc);
                     CreateStaging();
@@ -674,8 +774,8 @@ int main()
 
         if ((current.right - current.left != captureWidth) || (current.bottom - current.top != captureHeight))
         {
-            std::cout << "CS2 window resolution changed - restarting recording...\n";
-            Stop();
+            std::cout << "CS2 window resolution changed - stopping without save...\n";
+            Stop(false);
             cs2Window = nullptr;
             continue;
         }
@@ -685,7 +785,12 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    Stop();
-    std::cout << "Recording finished. Result: " << finalPath << "\n";
+    Stop(saveRequested);
+    if (saveRequested) {
+        std::cout << "Recording finished. Result: " << finalPath << "\n";
+    }
+    else {
+        std::cout << "Recording finished without saving clip.\n";
+    }
     return 0;
 }

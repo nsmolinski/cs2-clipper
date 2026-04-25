@@ -37,7 +37,8 @@ bool CaptureAudioLoop(
     const std::string& outputPath,
     std::atomic<bool>& runningFlag,
     CaptureTiming& timing,
-    int bufferSeconds
+    int bufferSeconds,
+    long long qpcFrequency
 )
 {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -160,7 +161,9 @@ bool CaptureAudioLoop(
             UINT32 frames;
             DWORD flags;
 
-            capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+            UINT64 devicePosition = 0;
+            UINT64 qpcPosition100ns = 0;
+            capture->GetBuffer(&data, &frames, &flags, &devicePosition, &qpcPosition100ns);
 
             uint32_t bytes = frames * header.blockAlign;
             if (bytes > 0 && !ringBuffer.empty()) {
@@ -177,12 +180,30 @@ bool CaptureAudioLoop(
                 bufferedBytes = (std::min)(bufferedBytes + static_cast<size_t>(bytes), ringCapacityBytes);
             }
             if (bytes > 0) {
+                long long packetStartQpc = -1;
+                if (qpcFrequency > 0 && qpcPosition100ns > 0) {
+                    packetStartQpc = static_cast<long long>(
+                        (qpcPosition100ns * static_cast<unsigned long long>(qpcFrequency) + 5000000ULL) / 10000000ULL
+                        );
+                }
+
+                long long packetEndQpc = packetStartQpc;
+                if (packetStartQpc >= 0 && header.sampleRate > 0 && frames > 0) {
+                    const long long packetDurationQpc =
+                        static_cast<long long>((static_cast<long double>(frames) * static_cast<long double>(qpcFrequency))
+                            / static_cast<long double>(header.sampleRate));
+                    packetEndQpc = packetStartQpc + packetDurationQpc;
+                }
+
                 LARGE_INTEGER qpcNow{};
                 QueryPerformanceCounter(&qpcNow);
+                const long long effectiveStartQpc = (packetStartQpc >= 0) ? packetStartQpc : qpcNow.QuadPart;
+                const long long effectiveEndQpc = (packetEndQpc >= 0) ? packetEndQpc : qpcNow.QuadPart;
+
                 if (timing.firstAudioQpc.load(std::memory_order_relaxed) < 0) {
-                    timing.firstAudioQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+                    timing.firstAudioQpc.store(effectiveStartQpc, std::memory_order_relaxed);
                 }
-                timing.lastAudioQpc.store(qpcNow.QuadPart, std::memory_order_relaxed);
+                timing.lastAudioQpc.store(effectiveEndQpc, std::memory_order_relaxed);
             }
             capture->ReleaseBuffer(frames);
             capture->GetNextPacketSize(&packetSize);
