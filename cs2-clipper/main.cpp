@@ -11,6 +11,8 @@
 #include <string>
 #include <cstdlib>
 #include <cmath>
+#include <TlHelp32.h>
+#include <cwchar>
 
 #include "audio.h"
 
@@ -56,6 +58,30 @@ int captureWidth = 0, captureHeight = 0;
 uint64_t lastPresentTime = 0;
 int replayBufferSeconds = kDefaultReplayBufferSeconds;
 
+bool IsProcessRunning(const wchar_t* processName)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (_wcsicmp(entry.szExeFile, processName) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return found;
+}
+
 int GetReplayBufferSeconds()
 {
     char* envValue = nullptr;
@@ -87,6 +113,13 @@ std::string FindFFmpeg()
 std::string BuildSessionId()
 {
     return std::to_string(std::time(nullptr));
+}
+
+std::string BuildClipOutputPath()
+{
+    const auto now = std::chrono::system_clock::now();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    return "C:\\CS2Recordings\\cs2_recording_" + std::to_string(nowMs) + ".mp4";
 }
 
 bool BuildResolvedConcatList(const std::string& sourcePath, const std::string& targetPath)
@@ -275,59 +308,46 @@ void StopAudio()
     }
 }
 
-void MergeAudioVideo()
+bool SaveCurrentReplayBuffer(std::string& outputPath)
 {
-    if (ffmpegPath.empty()) return;
+    if (ffmpegPath.empty()) return false;
     if (!std::filesystem::exists(concatListPath)) {
         std::cout << "Skipping merging - missing segment list.\n";
-        return;
+        return false;
     }
-    std::cout << "Merging replay buffer (audio+video from same FFmpeg timeline)\n";
+    std::cout << "Saving current replay buffer (audio+video)...\n";
     const std::string resolvedConcatListPath =
         (std::filesystem::path(tempSessionPath) / "segments_resolved.ffconcat").string();
     if (!BuildResolvedConcatList(concatListPath, resolvedConcatListPath)) {
         std::cout << "Failed to build resolved concat list\n";
-        return;
+        return false;
     }
 
+    outputPath = BuildClipOutputPath();
     std::string finalizeCmd =
         "\"" + ffmpegPath + "\" -y "
         "-f concat -safe 0 -i \"" + resolvedConcatListPath + "\" "
         "-fflags +genpts -avoid_negative_ts make_zero "
         "-c copy "
-        "\"" + finalPath + "\"";
+        "\"" + outputPath + "\"";
 
     DWORD code = 1;
     if (!RunCommand(finalizeCmd, code)) {
         std::cout << "Finalizing clip failed to start\n";
-        return;
+        return false;
     }
 
-    if (code == 0 && std::filesystem::exists(finalPath)) {
-        std::cout << "Clip finalized: " << finalPath << "\n";
-        std::error_code ec;
-        if (std::filesystem::exists(segmentDirPath)) {
-            for (const auto& entry : std::filesystem::directory_iterator(segmentDirPath)) {
-                std::filesystem::remove(entry.path(), ec);
-            }
-            std::filesystem::remove(segmentDirPath, ec);
-        }
-        std::filesystem::remove(concatListPath, ec);
-        std::filesystem::remove(resolvedConcatListPath, ec);
-        if (!tempSessionPath.empty()) {
-            std::filesystem::remove_all(tempSessionPath, ec);
-        }
-    }
-    else {
-        std::cout << "Finalizing failed (code " << code << "). Temporary files left.\n";
-    }
+    std::error_code ec;
+    std::filesystem::remove(resolvedConcatListPath, ec);
 
-    videoStarted = false;
-    audioStarted = false;
-    timing.firstAudioQpc.store(-1, std::memory_order_relaxed);
-    timing.lastAudioQpc.store(-1, std::memory_order_relaxed);
-    timing.firstVideoQpc.store(-1, std::memory_order_relaxed);
-    timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
+    if (code == 0 && std::filesystem::exists(outputPath)) {
+        std::cout << "Clip finalized: " << outputPath << "\n";
+        finalPath = outputPath;
+        return true;
+    }
+    
+    std::cout << "Finalizing failed (code " << code << ").\n";
+    return false;
 }
 
 bool InitDXGI()
@@ -504,6 +524,26 @@ void CleanupTemporaryCaptureFiles()
     }
 }
 
+void ResetCaptureTimingAndState()
+{
+    videoStarted = false;
+    audioStarted = false;
+    timing.firstAudioQpc.store(-1, std::memory_order_relaxed);
+    timing.lastAudioQpc.store(-1, std::memory_order_relaxed);
+    timing.firstVideoQpc.store(-1, std::memory_order_relaxed);
+    timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
+}
+
+void MergeAudioVideoOnStop()
+{
+    std::string outputPath;
+    if (!SaveCurrentReplayBuffer(outputPath)) {
+        std::cout << "Finalizing on stop failed.\n";
+    }
+    CleanupTemporaryCaptureFiles();
+    ResetCaptureTimingAndState();
+}
+
 void Stop(bool saveClip)
 {
     std::cout << "Stoping recording...\n";
@@ -522,6 +562,8 @@ void Stop(bool saveClip)
         WaitForSingleObject(ffmpegProc.hProcess, 4000);
         CloseHandle(ffmpegProc.hProcess);
         CloseHandle(ffmpegProc.hThread);
+        ffmpegProc.hProcess = nullptr;
+        ffmpegProc.hThread = nullptr;
     }
 
     if (staging) { staging->Release();     staging = nullptr; }
@@ -530,23 +572,58 @@ void Stop(bool saveClip)
     if (device) { device->Release();      device = nullptr; }
 
     if (saveClip) {
-        MergeAudioVideo();
+        MergeAudioVideoOnStop();
     }
     else {
         std::cout << "Capture stopped without saving clip.\n";
         CleanupTemporaryCaptureFiles();
-        videoStarted = false;
-        audioStarted = false;
-        timing.firstAudioQpc.store(-1, std::memory_order_relaxed);
-        timing.lastAudioQpc.store(-1, std::memory_order_relaxed);
-        timing.firstVideoQpc.store(-1, std::memory_order_relaxed);
-        timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
+        ResetCaptureTimingAndState();
     }
+}
+
+bool IsCapturePipelineReady()
+{
+    return ffmpegIn != nullptr && ffmpegProc.hProcess != nullptr && videoStarted && audioStarted;
+}
+
+void ResetReplayBufferPipeline()
+{
+    if (ffmpegIn)
+    {
+        FlushFileBuffers(ffmpegIn);
+        CloseHandle(ffmpegIn);
+        ffmpegIn = nullptr;
+    }
+
+    StopAudio();
+
+    if (ffmpegProc.hProcess)
+    {
+        WaitForSingleObject(ffmpegProc.hProcess, 4000);
+        CloseHandle(ffmpegProc.hProcess);
+        CloseHandle(ffmpegProc.hThread);
+        ffmpegProc.hProcess = nullptr;
+        ffmpegProc.hThread = nullptr;
+    }
+
+    CleanupTemporaryCaptureFiles();
+
+    PrepareOutputPaths();
+    timing.firstAudioQpc.store(-1, std::memory_order_relaxed);
+    timing.lastAudioQpc.store(-1, std::memory_order_relaxed);
+    timing.firstVideoQpc.store(-1, std::memory_order_relaxed);
+    timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
+
+    StartFFmpeg();
+    if (!ffmpegIn) {
+        std::cout << "Video pipeline failed to restart.\n";
+        return;
+    }
+    StartAudio();
 }
 
 int main()
 {
-    bool saveRequested = false;
     replayBufferSeconds = GetReplayBufferSeconds();
     std::cout << "=== CS2 Recorder - Fullscreen (60 fps) ===\n\n";
     std::cout << "Replay buffer length: " << replayBufferSeconds << "s\n";
@@ -554,14 +631,29 @@ int main()
     std::cout << "Launch CS2 in Fullscreen mode and wait...\n";
     std::cout << "Save clip hotkey: Alt+F12\n";
 
+    if (!IsProcessRunning(L"cs2.exe")) {
+        std::cout << "CS2 is not running. Start Counter-Strike 2 first, then run this program.\n";
+        return 1;
+    }
+
     while (running)
     {
         const bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         const bool f12PressedNow = (GetAsyncKeyState(VK_F12) & 0x0001) != 0;
         if (altHeld && f12PressedNow) {
-            std::cout << "Alt+F12 detected - saving clip...\n";
-            saveRequested = true;
-            break;
+            if (!IsCapturePipelineReady()) {
+                std::cout << "Alt+F12 detected, but replay buffer is not ready yet.\n";
+            }
+            else {
+                std::cout << "Alt+F12 detected - saving clip, then clearing replay buffer...\n";
+                std::string outputPath;
+                if (SaveCurrentReplayBuffer(outputPath)) {
+                    ResetReplayBufferPipeline();
+                }
+                else {
+                    std::cout << "Save failed.\n";
+                }
+            }
         }
 
         if (!cs2Window || !IsWindow(cs2Window))
@@ -618,12 +710,7 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    Stop(saveRequested);
-    if (saveRequested) {
-        std::cout << "Recording finished. Result: " << finalPath << "\n";
-    }
-    else {
-        std::cout << "Recording finished without saving clip.\n";
-    }
+    Stop(false);
+    std::cout << "Recording finished.\n";
     return 0;
 }
