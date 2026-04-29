@@ -9,10 +9,14 @@
 #include <thread>
 #include <atomic>
 #include <string>
+#include <deque>
+#include <mutex>
+#include <cctype>
 #include <cstdlib>
 #include <cmath>
 #include <TlHelp32.h>
 #include <cwchar>
+#include <cstdio>
 
 #include "audio.h"
 
@@ -57,6 +61,302 @@ int captureWidth = 0, captureHeight = 0;
 
 uint64_t lastPresentTime = 0;
 int replayBufferSeconds = kDefaultReplayBufferSeconds;
+std::atomic<bool> ipcReaderRunning{ false };
+std::thread ipcReaderThread;
+std::mutex ipcQueueMutex;
+
+struct IpcCommand
+{
+    std::string id;
+    std::string cmd;
+    int seconds = 0;
+    bool hasSeconds = false;
+    std::string chord;
+    bool hasChord = false;
+};
+
+std::deque<IpcCommand> ipcQueue;
+
+bool IsProcessRunning(const wchar_t* processName);
+
+struct HotkeyConfig
+{
+    bool alt = true;
+    bool ctrl = false;
+    bool shift = false;
+    int vk = VK_F12;
+    std::string display = "ALT+F12";
+};
+
+HotkeyConfig saveClipHotkey{};
+
+std::string JsonEscape(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size() + 16);
+    for (char c : value) {
+        if (c == '\\' || c == '"') {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+void EmitJson(const std::string& line)
+{
+    std::fwrite(line.c_str(), 1, line.size(), stdout);
+    std::fwrite("\n", 1, 1, stdout);
+    std::fflush(stdout);
+}
+
+void EmitAck(const std::string& id, bool ok, const std::string& error = "")
+{
+    std::string msg = "{\"type\":\"ack\",\"id\":\"" + JsonEscape(id) + "\",\"ok\":";
+    msg += ok ? "true" : "false";
+    if (!ok && !error.empty()) {
+        msg += ",\"error\":\"" + JsonEscape(error) + "\"";
+    }
+    msg += "}";
+    EmitJson(msg);
+}
+
+void EmitStatusEvent(const std::string& state)
+{
+    const bool cs2Running = IsProcessRunning(L"cs2.exe");
+    std::string msg =
+        "{\"type\":\"event\",\"event\":\"status\",\"protocol\":\"1.0\",\"state\":\"" + JsonEscape(state) +
+        "\",\"cs2Running\":" + std::string(cs2Running ? "true" : "false") +
+        ",\"bufferSeconds\":" + std::to_string(replayBufferSeconds) +
+        ",\"saveHotkey\":\"" + JsonEscape(saveClipHotkey.display) + "\"" +
+        ",\"bufferReady\":" + std::string((ffmpegIn != nullptr && audioRunning) ? "true" : "false") +
+        "}";
+    EmitJson(msg);
+}
+
+void EmitClipSavedEvent(const std::string& path)
+{
+    EmitJson(
+        "{\"type\":\"event\",\"event\":\"clip_saved\",\"path\":\"" + JsonEscape(path) +
+        "\",\"bufferSeconds\":" + std::to_string(replayBufferSeconds) + "}"
+    );
+}
+
+void EmitWarningEvent(const std::string& message)
+{
+    EmitJson("{\"type\":\"event\",\"event\":\"warning\",\"message\":\"" + JsonEscape(message) + "\"}");
+}
+
+void EmitErrorEvent(const std::string& code, const std::string& message)
+{
+    EmitJson(
+        "{\"type\":\"event\",\"event\":\"error\",\"code\":\"" + JsonEscape(code) +
+        "\",\"message\":\"" + JsonEscape(message) + "\"}"
+    );
+}
+
+bool ExtractJsonString(const std::string& jsonLine, const std::string& key, std::string& out)
+{
+    const std::string token = "\"" + key + "\":";
+    size_t pos = jsonLine.find(token);
+    if (pos == std::string::npos) return false;
+    pos = jsonLine.find('"', pos + token.size());
+    if (pos == std::string::npos) return false;
+    const size_t start = pos + 1;
+    size_t end = start;
+    while (end < jsonLine.size()) {
+        if (jsonLine[end] == '"' && (end == start || jsonLine[end - 1] != '\\')) break;
+        end++;
+    }
+    if (end >= jsonLine.size()) return false;
+    out = jsonLine.substr(start, end - start);
+    return true;
+}
+
+bool ExtractJsonInt(const std::string& jsonLine, const std::string& key, int& out)
+{
+    const std::string token = "\"" + key + "\":";
+    size_t pos = jsonLine.find(token);
+    if (pos == std::string::npos) return false;
+    size_t start = jsonLine.find_first_of("-0123456789", pos + token.size());
+    if (start == std::string::npos) return false;
+    size_t end = start + 1;
+    while (end < jsonLine.size() && std::isdigit(static_cast<unsigned char>(jsonLine[end]))) end++;
+    out = std::atoi(jsonLine.substr(start, end - start).c_str());
+    return true;
+}
+
+bool ParseIpcCommand(const std::string& line, IpcCommand& out)
+{
+    std::string type;
+    if (!ExtractJsonString(line, "type", type) || type != "cmd") return false;
+    if (!ExtractJsonString(line, "id", out.id)) return false;
+    if (!ExtractJsonString(line, "cmd", out.cmd)) return false;
+    out.hasSeconds = ExtractJsonInt(line, "seconds", out.seconds);
+    out.hasChord = ExtractJsonString(line, "chord", out.chord);
+    return true;
+}
+
+void StartIpcReader()
+{
+    ipcReaderRunning = true;
+    ipcReaderThread = std::thread([] {
+        std::string line;
+        while (ipcReaderRunning && std::getline(std::cin, line)) {
+            if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
+                continue;
+            }
+            IpcCommand cmd{};
+            if (!ParseIpcCommand(line, cmd)) {
+                EmitErrorEvent("invalid_json_command", "Malformed command or missing fields.");
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(ipcQueueMutex);
+            ipcQueue.push_back(cmd);
+        }
+    });
+}
+
+void StopIpcReader()
+{
+    ipcReaderRunning = false;
+    if (ipcReaderThread.joinable()) {
+        ipcReaderThread.detach();
+    }
+}
+
+std::string ToUpperAscii(std::string value)
+{
+    for (char& c : value) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+std::string TrimAscii(const std::string& value)
+{
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+        start++;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        end--;
+    }
+    return value.substr(start, end - start);
+}
+
+bool ParseKeyTokenToVk(const std::string& tokenUpper, int& vk)
+{
+    if (tokenUpper.size() == 1) {
+        const char c = tokenUpper[0];
+        if (c >= 'A' && c <= 'Z') {
+            vk = static_cast<int>(c);
+            return true;
+        }
+        if (c >= '0' && c <= '9') {
+            vk = static_cast<int>(c);
+            return true;
+        }
+    }
+
+    if (tokenUpper.size() >= 2 && tokenUpper[0] == 'F') {
+        const int fn = std::atoi(tokenUpper.substr(1).c_str());
+        if (fn >= 1 && fn <= 24) {
+            vk = VK_F1 + (fn - 1);
+            return true;
+        }
+    }
+
+    if (tokenUpper == "SPACE") { vk = VK_SPACE; return true; }
+    if (tokenUpper == "TAB") { vk = VK_TAB; return true; }
+    if (tokenUpper == "ENTER") { vk = VK_RETURN; return true; }
+    if (tokenUpper == "ESC" || tokenUpper == "ESCAPE") { vk = VK_ESCAPE; return true; }
+    return false;
+}
+
+bool ParseHotkeyChord(const std::string& chord, HotkeyConfig& outConfig, std::string& errorCode)
+{
+    HotkeyConfig parsed{};
+    parsed.alt = false;
+    parsed.ctrl = false;
+    parsed.shift = false;
+    parsed.vk = 0;
+    parsed.display = "";
+
+    size_t start = 0;
+    bool haveKeyToken = false;
+    while (start <= chord.size()) {
+        size_t plusPos = chord.find('+', start);
+        const std::string rawToken = (plusPos == std::string::npos)
+            ? chord.substr(start)
+            : chord.substr(start, plusPos - start);
+        const std::string token = ToUpperAscii(TrimAscii(rawToken));
+
+        if (token.empty()) {
+            errorCode = "invalid_hotkey_format";
+            return false;
+        }
+
+        if (token == "ALT") {
+            parsed.alt = true;
+        }
+        else if (token == "CTRL" || token == "CONTROL") {
+            parsed.ctrl = true;
+        }
+        else if (token == "SHIFT") {
+            parsed.shift = true;
+        }
+        else {
+            if (haveKeyToken) {
+                errorCode = "invalid_hotkey_multiple_keys";
+                return false;
+            }
+            int parsedVk = 0;
+            if (!ParseKeyTokenToVk(token, parsedVk)) {
+                errorCode = "invalid_hotkey_key";
+                return false;
+            }
+            parsed.vk = parsedVk;
+            haveKeyToken = true;
+        }
+
+        if (plusPos == std::string::npos) {
+            break;
+        }
+        start = plusPos + 1;
+    }
+
+    if (!haveKeyToken) {
+        errorCode = "invalid_hotkey_missing_key";
+        return false;
+    }
+
+    std::string display;
+    if (parsed.ctrl) display += "CTRL+";
+    if (parsed.shift) display += "SHIFT+";
+    if (parsed.alt) display += "ALT+";
+    display += ToUpperAscii(TrimAscii(chord.substr(chord.find_last_of('+') == std::string::npos ? 0 : chord.find_last_of('+') + 1)));
+    parsed.display = display;
+
+    outConfig = parsed;
+    return true;
+}
+
+bool IsSaveHotkeyPressedNow()
+{
+    const bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    const bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool keyPressedNow = (GetAsyncKeyState(saveClipHotkey.vk) & 0x0001) != 0;
+
+    const bool modifiersOk =
+        (!saveClipHotkey.alt || altHeld) &&
+        (!saveClipHotkey.ctrl || ctrlHeld) &&
+        (!saveClipHotkey.shift || shiftHeld);
+
+    return modifiersOk && keyPressedNow;
+}
 
 bool IsProcessRunning(const wchar_t* processName)
 {
@@ -534,20 +834,8 @@ void ResetCaptureTimingAndState()
     timing.lastVideoQpc.store(-1, std::memory_order_relaxed);
 }
 
-void MergeAudioVideoOnStop()
+void StopActiveReplayPipeline()
 {
-    std::string outputPath;
-    if (!SaveCurrentReplayBuffer(outputPath)) {
-        std::cout << "Finalizing on stop failed.\n";
-    }
-    CleanupTemporaryCaptureFiles();
-    ResetCaptureTimingAndState();
-}
-
-void Stop(bool saveClip)
-{
-    std::cout << "Stoping recording...\n";
-
     if (ffmpegIn)
     {
         FlushFileBuffers(ffmpegIn);
@@ -565,6 +853,26 @@ void Stop(bool saveClip)
         ffmpegProc.hProcess = nullptr;
         ffmpegProc.hThread = nullptr;
     }
+
+    videoStarted = false;
+    audioStarted = false;
+}
+
+void MergeAudioVideoOnStop()
+{
+    std::string outputPath;
+    if (!SaveCurrentReplayBuffer(outputPath)) {
+        std::cout << "Finalizing on stop failed.\n";
+    }
+    CleanupTemporaryCaptureFiles();
+    ResetCaptureTimingAndState();
+}
+
+void Stop(bool saveClip)
+{
+    std::cout << "Stoping recording...\n";
+
+    StopActiveReplayPipeline();
 
     if (staging) { staging->Release();     staging = nullptr; }
     if (duplication) { duplication->Release(); duplication = nullptr; }
@@ -588,23 +896,7 @@ bool IsCapturePipelineReady()
 
 void ResetReplayBufferPipeline()
 {
-    if (ffmpegIn)
-    {
-        FlushFileBuffers(ffmpegIn);
-        CloseHandle(ffmpegIn);
-        ffmpegIn = nullptr;
-    }
-
-    StopAudio();
-
-    if (ffmpegProc.hProcess)
-    {
-        WaitForSingleObject(ffmpegProc.hProcess, 4000);
-        CloseHandle(ffmpegProc.hProcess);
-        CloseHandle(ffmpegProc.hThread);
-        ffmpegProc.hProcess = nullptr;
-        ffmpegProc.hThread = nullptr;
-    }
+    StopActiveReplayPipeline();
 
     CleanupTemporaryCaptureFiles();
 
@@ -622,37 +914,134 @@ void ResetReplayBufferPipeline()
     StartAudio();
 }
 
+bool HandleSaveClipRequest(std::string& outputPath, const char* sourceTag)
+{
+    if (!IsCapturePipelineReady()) {
+        std::cout << sourceTag << ": replay buffer is not ready yet.\n";
+        return false;
+    }
+
+    StopActiveReplayPipeline();
+
+    if (!SaveCurrentReplayBuffer(outputPath)) {
+        std::cout << sourceTag << ": save failed.\n";
+        ResetReplayBufferPipeline();
+        return false;
+    }
+
+    ResetReplayBufferPipeline();
+    return true;
+}
+
+void ProcessIpcCommands()
+{
+    std::deque<IpcCommand> pending;
+    {
+        std::lock_guard<std::mutex> lock(ipcQueueMutex);
+        pending.swap(ipcQueue);
+    }
+
+    for (const auto& cmd : pending) {
+        if (cmd.cmd == "ping") {
+            EmitAck(cmd.id, true);
+            continue;
+        }
+
+        if (cmd.cmd == "get_status") {
+            EmitAck(cmd.id, true);
+            EmitStatusEvent(IsCapturePipelineReady() ? "recording" : "idle");
+            continue;
+        }
+
+        if (cmd.cmd == "save_clip") {
+            std::string path;
+            if (HandleSaveClipRequest(path, "IPC save_clip")) {
+                EmitAck(cmd.id, true);
+                EmitClipSavedEvent(path);
+                EmitStatusEvent(IsCapturePipelineReady() ? "recording" : "idle");
+            }
+            else {
+                EmitAck(cmd.id, false, "buffer_not_ready_or_save_failed");
+            }
+            continue;
+        }
+
+        if (cmd.cmd == "set_buffer") {
+            if (!cmd.hasSeconds) {
+                EmitAck(cmd.id, false, "missing_seconds");
+                continue;
+            }
+            if (cmd.seconds != 15 && cmd.seconds != 30) {
+                EmitAck(cmd.id, false, "invalid_buffer_seconds");
+                continue;
+            }
+
+            replayBufferSeconds = cmd.seconds;
+            if (IsCapturePipelineReady()) {
+                ResetReplayBufferPipeline();
+            }
+            EmitAck(cmd.id, true);
+            EmitStatusEvent(IsCapturePipelineReady() ? "recording" : "idle");
+            continue;
+        }
+
+        if (cmd.cmd == "set_hotkey") {
+            if (!cmd.hasChord) {
+                EmitAck(cmd.id, false, "missing_chord");
+                continue;
+            }
+
+            HotkeyConfig parsed{};
+            std::string hotkeyError;
+            if (!ParseHotkeyChord(cmd.chord, parsed, hotkeyError)) {
+                EmitAck(cmd.id, false, hotkeyError.empty() ? "invalid_hotkey" : hotkeyError);
+                continue;
+            }
+
+            saveClipHotkey = parsed;
+            EmitAck(cmd.id, true);
+            EmitStatusEvent(IsCapturePipelineReady() ? "recording" : "idle");
+            continue;
+        }
+
+        if (cmd.cmd == "shutdown") {
+            EmitAck(cmd.id, true);
+            running = false;
+            continue;
+        }
+
+        EmitAck(cmd.id, false, "unknown_command");
+    }
+}
+
 int main()
 {
+    std::cout.rdbuf(std::cerr.rdbuf());
+
     replayBufferSeconds = GetReplayBufferSeconds();
     std::cout << "=== CS2 Recorder - Fullscreen (60 fps) ===\n\n";
     std::cout << "Replay buffer length: " << replayBufferSeconds << "s\n";
     std::cout << "A/V mode: single FFmpeg timeline (shared sync)\n";
     std::cout << "Launch CS2 in Fullscreen mode and wait...\n";
-    std::cout << "Save clip hotkey: Alt+F12\n";
+    std::cout << "Save clip hotkey: " << saveClipHotkey.display << "\n";
 
     if (!IsProcessRunning(L"cs2.exe")) {
         std::cout << "CS2 is not running. Start Counter-Strike 2 first, then run this program.\n";
         return 1;
     }
 
+    StartIpcReader();
+    EmitStatusEvent("starting");
+
     while (running)
     {
-        const bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-        const bool f12PressedNow = (GetAsyncKeyState(VK_F12) & 0x0001) != 0;
-        if (altHeld && f12PressedNow) {
-            if (!IsCapturePipelineReady()) {
-                std::cout << "Alt+F12 detected, but replay buffer is not ready yet.\n";
-            }
-            else {
-                std::cout << "Alt+F12 detected - saving clip, then clearing replay buffer...\n";
-                std::string outputPath;
-                if (SaveCurrentReplayBuffer(outputPath)) {
-                    ResetReplayBufferPipeline();
-                }
-                else {
-                    std::cout << "Save failed.\n";
-                }
+        ProcessIpcCommands();
+
+        if (IsSaveHotkeyPressedNow()) {
+            std::string outputPath;
+            if (HandleSaveClipRequest(outputPath, "Hotkey")) {
+                EmitClipSavedEvent(outputPath);
+                EmitStatusEvent(IsCapturePipelineReady() ? "recording" : "idle");
             }
         }
 
@@ -661,6 +1050,8 @@ int main()
             if (videoStarted || audioStarted || ffmpegIn || audioRunning) {
                 std::cout << "CS2 closed/lost - stopping without save.\n";
                 Stop(false);
+                EmitWarningEvent("cs2_lost");
+                EmitStatusEvent("idle");
             }
 
             if (UpdateCS2Window())
@@ -683,9 +1074,11 @@ int main()
                     StartFFmpeg();
                     if (!ffmpegIn) {
                         std::cout << "Video pipeline failed to start.\n";
+                        EmitErrorEvent("video_pipeline_start_failed", "Video pipeline failed to start.");
                     }
                     else {
                         StartAudio();
+                        EmitStatusEvent(IsCapturePipelineReady() ? "recording" : "idle");
                     }
                 }
             }
@@ -702,6 +1095,8 @@ int main()
             std::cout << "CS2 window resolution changed - stopping without save...\n";
             Stop(false);
             cs2Window = nullptr;
+            EmitWarningEvent("cs2_resolution_changed");
+            EmitStatusEvent("idle");
             continue;
         }
 
@@ -711,6 +1106,8 @@ int main()
     }
 
     Stop(false);
+    StopIpcReader();
+    EmitStatusEvent("stopped");
     std::cout << "Recording finished.\n";
     return 0;
 }

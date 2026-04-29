@@ -15,15 +15,15 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="audio.cpp">
+    <ClCompile Include="src\core\audio.cpp">
       <Filter>Pliki źródłowe</Filter>
     </ClCompile>
-    <ClCompile Include="main.cpp">
+    <ClCompile Include="src\core\main.cpp">
       <Filter>Pliki źródłowe</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="audio.h">
+    <ClInclude Include="src\core\audio.h">
       <Filter>Pliki źródłowe</Filter>
     </ClInclude>
   </ItemGroup>
