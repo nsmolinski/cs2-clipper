@@ -1,0 +1,22 @@
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+  
+  <path 
+    d="M5 4 L5 2 L14 2 L14 11 L12 11" 
+    stroke="#b8b8b8"
+    stroke-width="1" 
+    fill="none" 
+    stroke-linejoin="miter"
+    shape-rendering="crispEdges"
+  />
+  
+  <rect 
+    x="2" 
+    y="5" 
+    width="9" 
+    height="9" 
+    stroke="#b8b8b8"
+    stroke-width="1" 
+    fill="none"
+    shape-rendering="crispEdges"
+  />
+</svg>
