@@ -22,9 +22,11 @@ const TitleBar = () => {
         checkMaximized();
     };
     return(
-        <div className="title-bar h-10 flex items-center justify-between [-webkit-app-region:drag]">
-            <img src={Logo} className="w-8 h-8 ml-2" />
-
+        <div className="fixed z-1000 w-full title-bar h-14 flex items-center justify-between [-webkit-app-region:drag] border-b border-[#333]">
+            <div className='flex items-center ml-4 gap-2'>
+                <img src={Logo} className="w-8 h-8" />
+                <h1 className='text-sm font-medium tracking-wider uppercase'> <span className='text-orange-400'>CS2</span> Clipper</h1>
+            </div>
             <div className="flex items-center h-full">
                 <div className='flex justify-center items-center w-12 h-full [-webkit-app-region:no-drag] h-full' onClick={() => window.api.minimizeApp()}>
                     <img src={minusIcon} className='w-4'/>

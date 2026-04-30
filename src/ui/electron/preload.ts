@@ -4,7 +4,11 @@ contextBridge.exposeInMainWorld('api', {
   closeApp: () => ipcRenderer.send('app-close'),
   minimizeApp: () => ipcRenderer.send('app-minimize'),
   maximizeApp : () => ipcRenderer.invoke('app-maximize'),
-  isMaximized : () => ipcRenderer.invoke('app-is-maximized')
+  isMaximized : () => ipcRenderer.invoke('app-is-maximized'),
+  onCS2Status: (callback: (state: boolean) => void) => ipcRenderer.on("cs2-status", (_, value) => callback(value)),
+  startCapture: () => ipcRenderer.invoke("start-capture"),
+  stopCapture: () => ipcRenderer.invoke("stop-capture"),
+  saveClip: () => ipcRenderer.invoke("save-clip")
 })
 
 contextBridge.exposeInMainWorld('ipcRenderer', {
