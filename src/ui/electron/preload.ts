@@ -5,10 +5,20 @@ contextBridge.exposeInMainWorld('api', {
   minimizeApp: () => ipcRenderer.send('app-minimize'),
   maximizeApp : () => ipcRenderer.invoke('app-maximize'),
   isMaximized : () => ipcRenderer.invoke('app-is-maximized'),
-  onCS2Status: (callback: (state: boolean) => void) => ipcRenderer.on("cs2-status", (_, value) => callback(value)),
-  startCapture: () => ipcRenderer.invoke("start-capture"),
-  stopCapture: () => ipcRenderer.invoke("stop-capture"),
-  saveClip: () => ipcRenderer.invoke("save-clip")
+  onCS2Status: (callback: (state: boolean) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, value: boolean) => callback(value)
+    ipcRenderer.on('cs2-status', listener)
+    return () => ipcRenderer.removeListener('cs2-status', listener)
+  },
+  onClipsUpdated: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('clips-updated', listener)
+    return () => ipcRenderer.removeListener('clips-updated', listener)
+  },
+  startCapture: () => ipcRenderer.invoke('start-capture'),
+  stopCapture: () => ipcRenderer.invoke('stop-capture'),
+  saveClip: () => ipcRenderer.invoke('save-clip'),
+  getClips: () => ipcRenderer.invoke('get-clips')
 })
 
 contextBridge.exposeInMainWorld('ipcRenderer', {

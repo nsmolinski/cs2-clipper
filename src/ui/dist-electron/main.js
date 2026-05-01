@@ -1,9 +1,8 @@
 import { ipcMain, BrowserWindow, app, globalShortcut } from "electron";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { exec, spawn } from "child_process";
-createRequire(import.meta.url);
+import fs from "fs";
 const __dirname$1 = path.dirname(fileURLToPath(import.meta.url));
 process.env.APP_ROOT = path.join(__dirname$1, "..");
 const VITE_DEV_SERVER_URL = process.env["VITE_DEV_SERVER_URL"];
@@ -14,6 +13,20 @@ let win;
 let captureProcess = null;
 let cs2Interval = null;
 let isLaunched = false;
+let clipsWatcher = null;
+const clipsPath = "C:/CS2Recordings";
+function setupClipsWatcher() {
+  if (clipsWatcher) {
+    clipsWatcher.close();
+  }
+  if (fs.existsSync(clipsPath)) {
+    clipsWatcher = fs.watch(clipsPath, (_eventType, filename) => {
+      if (filename && (filename.endsWith(".mp4") || filename.endsWith(".mkv"))) {
+        win == null ? void 0 : win.webContents.send("clips-updated");
+      }
+    });
+  }
+}
 function createWindow() {
   win = new BrowserWindow({
     width: 1280,
@@ -22,7 +35,8 @@ function createWindow() {
     frame: false,
     titleBarStyle: "hidden",
     webPreferences: {
-      preload: path.join(__dirname$1, "preload.mjs")
+      preload: path.join(__dirname$1, "preload.mjs"),
+      webSecurity: !VITE_DEV_SERVER_URL
     }
   });
   win.webContents.on("did-finish-load", () => {
@@ -97,6 +111,17 @@ ipcMain.handle("stop-capture", async () => {
   }
   return true;
 });
+ipcMain.handle("get-clips", async () => {
+  try {
+    const files = await fs.promises.readdir(clipsPath);
+    return files.filter((f) => (f.endsWith(".mp4") || f.endsWith(".mkv")) && f.startsWith("cs2_recording")).map((f) => ({
+      title: path.parse(f).name,
+      path: path.join(clipsPath, f)
+    }));
+  } catch (_error) {
+    return [];
+  }
+});
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
@@ -109,6 +134,7 @@ app.on("before-quit", () => {
 });
 app.whenReady().then(() => {
   createWindow();
+  setupClipsWatcher();
   globalShortcut.register("Alt+F12", async () => {
     try {
       if (!captureProcess || captureProcess.killed) {

@@ -1,10 +1,9 @@
 import { app, BrowserWindow, ipcMain, globalShortcut } from 'electron'
-import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { exec } from 'child_process'
 import { spawn } from "child_process"
-const require = createRequire(import.meta.url)
+import fs from "fs"
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 process.env.APP_ROOT = path.join(__dirname, '..')
@@ -19,6 +18,23 @@ let win: BrowserWindow | null
 let captureProcess: any = null
 let cs2Interval: NodeJS.Timeout | null = null
 let isLaunched = false
+let clipsWatcher: any = null
+
+const clipsPath = "C:/CS2Recordings"
+
+function setupClipsWatcher() {
+  if (clipsWatcher) {
+    clipsWatcher.close()
+  }
+  
+  if (fs.existsSync(clipsPath)) {
+    clipsWatcher = fs.watch(clipsPath, (_eventType, filename) => {
+      if (filename && (filename.endsWith('.mp4') || filename.endsWith('.mkv'))) {
+        win?.webContents.send('clips-updated')
+      }
+    })
+  }
+}
 
 function createWindow() {
   win = new BrowserWindow({
@@ -29,6 +45,7 @@ function createWindow() {
     titleBarStyle: 'hidden',
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
+      webSecurity: !VITE_DEV_SERVER_URL,
     },
   })
 
@@ -85,7 +102,7 @@ cs2Interval = setInterval(() => {
   })
 }, 1000)
 
-ipcMain.handle("start-capture", async () => {
+ipcMain.handle('start-capture', async () => {
   const exePath = path.join(process.env.APP_ROOT, '..', '..', 'x64', 'Debug', 'cs2-clipper.exe')
   const workDir = path.join(process.env.APP_ROOT, '..', '..')
 
@@ -97,7 +114,7 @@ ipcMain.handle("start-capture", async () => {
   return true
 })
 
-ipcMain.handle("save-clip", async () => {
+ipcMain.handle('save-clip', async () => {
   if (captureProcess && captureProcess.stdin && !captureProcess.killed) {
     const cmd = JSON.stringify({
       type: "cmd",
@@ -109,12 +126,26 @@ ipcMain.handle("save-clip", async () => {
   return true
 })
 
-ipcMain.handle("stop-capture", async () => {
+ipcMain.handle('stop-capture', async () => {
   if (captureProcess) {
     captureProcess.kill("SIGTERM")
     captureProcess = null
   }
   return true
+})
+ipcMain.handle('get-clips', async () => {
+  try {
+    const files = await fs.promises.readdir(clipsPath)
+
+    return files
+      .filter(f => (f.endsWith(".mp4") || f.endsWith(".mkv")) && f.startsWith("cs2_recording"))
+      .map(f => ({
+        title: path.parse(f).name,
+        path: path.join(clipsPath, f)
+      }))
+  } catch (_error) {
+    return []
+  }
 })
 
 app.on('activate', () => {
@@ -131,6 +162,7 @@ app.on('before-quit', () => {
 
 app.whenReady().then(() => {
   createWindow()
+  setupClipsWatcher()
   
   globalShortcut.register('Alt+F12', async () => {
     try {
